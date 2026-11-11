@@ -54,6 +54,8 @@ class IdentityConfig:
     cluster_threshold: float = 0.45
     max_faces_per_track: int = 24
     sample_every: int = 5
+    # Face must clear this IoU against the head zone before it is bound to a track.
+    min_face_iou: float = 0.2
 
 
 @dataclass

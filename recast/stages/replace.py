@@ -141,6 +141,7 @@ class InswapperBackend:
         self._swapper: Any = None
         self._source_face: Any = None
         self._device = "cpu"
+        self._min_face_iou = 0.2
 
     def load(self, cfg: RecastConfig, device: str) -> None:
         from insightface.app import FaceAnalysis
@@ -157,6 +158,7 @@ class InswapperBackend:
         self._swapper = get_model(str(model_path), providers=providers)
         if hasattr(self._swapper, "prepare"):
             self._swapper.prepare(ctx_id=ctx_id)
+        self._min_face_iou = float(getattr(cfg.identity, "min_face_iou", 0.2))
         vram_report("替换-已加载")
 
     def _best_face(self, face_image_path: str | Path) -> Any | None:
@@ -211,26 +213,17 @@ class InswapperBackend:
         faces = self._app.get(frame) or []
         if not faces:
             return frame
+        from recast.stages.face_match import match_boxes
+
+        face_boxes = [[float(x) for x in face.bbox] for face in faces]
+        pairs = match_boxes(target_bboxes, face_boxes, min_iou=self._min_face_iou)
         out = frame
-        used: set[int] = set()
-        for bbox, source in zip(target_bboxes, source_faces):
+        for person_i, face_i in pairs:
+            source = source_faces[person_i] if person_i < len(source_faces) else None
             if source is None:
                 continue
-            best_i, best = -1, 0.0
-            for i, face in enumerate(faces):
-                if i in used:
-                    continue
-                fb = [float(x) for x in face.bbox]
-                score = _iou(bbox, fb)
-                if score < 0.05 and _center_in(bbox, fb):
-                    score = max(score, 0.12)
-                if score > best:
-                    best_i, best = i, score
-            if best_i < 0 or best < 0.05:
-                continue
-            used.add(best_i)
             try:
-                out = self._swapper.get(out, faces[best_i], source, paste_back=True)
+                out = self._swapper.get(out, faces[face_i], source, paste_back=True)
             except Exception as exc:
                 log.debug("单帧替换失败: %s", exc)
         return out

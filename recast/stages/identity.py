@@ -71,25 +71,16 @@ def build_face_app(model_name: str, det_size: int, device: str):
     return app
 
 
-def _associate(faces: list[Any], detections: list[dict[str, Any]]) -> list[tuple[int, Any]]:
-    """Greedy match of faces to person tracks in the same frame."""
-    used_faces: set[int] = set()
-    assigned: list[tuple[int, Any]] = []
-    for det in detections:
-        best_i, best_score = -1, 0.0
-        for i, face in enumerate(faces):
-            if i in used_faces:
-                continue
-            fb = [float(x) for x in face.bbox]
-            score = _iou(det["bbox"], fb)
-            if score < 0.05 and _contains(det["bbox"], fb):
-                score = max(score, 0.15)
-            if score > best_score:
-                best_i, best_score = i, score
-        if best_i >= 0 and best_score >= 0.05:
-            used_faces.add(best_i)
-            assigned.append((int(det["track_id"]), faces[best_i]))
-    return assigned
+def _associate(
+    faces: list[Any],
+    detections: list[dict[str, Any]],
+    *,
+    min_iou: float | None = None,
+) -> list[tuple[int, Any]]:
+    """Mutual best match of faces to person tracks. Same rule as L1 replace."""
+    from recast.stages.face_match import MIN_FACE_IOU, match_detections
+
+    return match_detections(faces, detections, min_iou=MIN_FACE_IOU if min_iou is None else min_iou)
 
 
 def _cluster_tracks(
@@ -163,7 +154,7 @@ def run(
         if frame_idx in frames_of_interest:
             dets = frames_of_interest[frame_idx]
             faces = app.get(frame) or []
-            for tid, face in _associate(faces, dets):
+            for tid, face in _associate(faces, dets, min_iou=float(cfg.identity.min_face_iou)):
                 emb = _l2_normalize(np.asarray(face.embedding, dtype=np.float32))
                 embeddings[tid].append(emb)
                 samples_meta[tid].append(
