@@ -273,8 +273,16 @@ def run_script_episode(
             from recast.generate.tts import load_wav_table, synthesize_table
             from recast.generate.stitch import stitch_and_dub
 
+            from recast.generate.tts import voices_by_speaker
+
             table = load_wav_table(wav_table) if wav_table else None
-            tts = synthesize_table(shots, workdir / "dub", wav_table=table, allow_engines=allow_tts)
+            tts = synthesize_table(
+                shots,
+                workdir / "dub",
+                wav_table=table,
+                voices=voices_by_speaker(pack.characters),
+                allow_engines=allow_tts,
+            )
             if tts.get("skipped"):
                 log.info("有 %s 条对白跳过了配音，仍会写出 SRT。", tts["skipped"])
                 rec["message"] = f"跳过 {tts['skipped']} 条配音，已导出 SRT"
@@ -290,6 +298,17 @@ def run_script_episode(
             )
             rec["model"] = "ffmpeg+tts"
             summary.update(result)
+            for note in result.get("confirmations") or []:
+                log.warning("%s", note.get("message"))
+                if store and task_id:
+                    store.insert(
+                        "quality_marks",
+                        task_id=task_id,
+                        shot_code=note.get("shot_code"),
+                        reason="配音超出镜头",
+                        detail=note.get("message"),
+                        status=ST_REVIEW,
+                    )
             if store and task_id:
                 store.replace_shots(task_id, shots)
                 if result.get("output"):
