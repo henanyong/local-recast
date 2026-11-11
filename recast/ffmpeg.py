@@ -103,6 +103,7 @@ class VideoInfo:
     has_audio: bool
     video_codec: str = ""
     audio_codec: str = ""
+    is_vfr: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -156,35 +157,87 @@ def probe_video(path: str | Path) -> VideoInfo:
     if video is None:
         raise FFmpegError(f"文件没有视频流: {src}")
 
-    fps = _parse_fps(video.get("avg_frame_rate")) or _parse_fps(video.get("r_frame_rate"))
-    duration = 0.0
-    for candidate in (video.get("duration"), fmt.get("duration")):
-        if candidate not in (None, "N/A", ""):
-            try:
-                duration = float(candidate)
-                break
-            except ValueError:
-                continue
-    nb = video.get("nb_frames")
-    try:
-        frame_count = int(nb) if nb not in (None, "N/A", "") else 0
-    except ValueError:
-        frame_count = 0
-    if frame_count <= 0 and duration > 0 and fps > 0:
-        frame_count = int(round(duration * fps))
+    fps, frame_count, is_vfr, duration = interpret_timing(video, fmt)
     width = int(video.get("width") or 0)
     height = int(video.get("height") or 0)
     return VideoInfo(
         path=str(src.resolve()),
         width=width,
         height=height,
-        fps=float(fps or 25.0),
-        duration=float(duration),
+        fps=fps,
+        duration=duration,
         frame_count=frame_count,
         has_audio=audio is not None,
         video_codec=str(video.get("codec_name") or ""),
         audio_codec=str((audio or {}).get("codec_name") or ""),
+        is_vfr=is_vfr,
     )
+
+
+def interpret_timing(video: dict, fmt: dict | None = None) -> tuple[float, int, bool, float]:
+    """Return fps, frame_count, is_vfr, duration.
+
+    A missing frame rate is an error. Variable frame rate is detected when the
+    average rate and the container rate disagree, or when nb_frames/duration
+    does not match the average rate. Callers should transcode VFR to CFR
+    before indexing frames.
+    """
+    fmt = fmt or {}
+    average = _parse_fps(video.get("avg_frame_rate"))
+    reported = _parse_fps(video.get("r_frame_rate"))
+    if average <= 0 and reported <= 0:
+        raise FFmpegError("无法确定视频帧率，不会默认成 25fps。请先把片源转成恒定帧率。")
+    fps = average or reported
+    duration = 0.0
+    for candidate in (video.get("duration"), fmt.get("duration")):
+        if candidate not in (None, "N/A", ""):
+            try:
+                duration = float(candidate)
+                break
+            except (TypeError, ValueError):
+                continue
+    raw_count = video.get("nb_frames")
+    try:
+        frame_count = int(raw_count) if raw_count not in (None, "N/A", "") else 0
+    except (TypeError, ValueError):
+        frame_count = 0
+    is_vfr = False
+    if average > 0 and reported > 0 and abs(average - reported) / max(average, reported) > 0.01:
+        is_vfr = True
+    if frame_count > 0 and duration > 0 and fps > 0:
+        implied = frame_count / duration
+        if abs(implied - fps) / fps > 0.01:
+            is_vfr = True
+    if frame_count <= 0 and duration > 0 and fps > 0 and not is_vfr:
+        frame_count = int(round(duration * fps))
+    return float(fps), frame_count, is_vfr, float(duration)
+
+
+def ensure_constant_frame_rate(src: str | Path, dest: str | Path, fps: float) -> Path:
+    """Transcode a VFR file to CFR so later stages can use frame indexes."""
+    if fps <= 0:
+        raise FFmpegError("无法把可变帧率转成恒定帧率：帧率未知。")
+    out = Path(dest)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    rate = f"{fps:.3f}".rstrip("0").rstrip(".")
+    run_ffmpeg(
+        [
+            "-i",
+            str(src),
+            "-vf",
+            f"fps={rate}",
+            "-r",
+            rate,
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "copy",
+            str(out),
+        ]
+    )
+    return out
 
 
 def extract_audio(video: str | Path, wav_path: str | Path, sample_rate: int = 16000) -> Path | None:

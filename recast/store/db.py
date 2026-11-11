@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -221,6 +222,54 @@ CREATE INDEX IF NOT EXISTS idx_ckpt_task ON checkpoints(task_id, step);
 CREATE INDEX IF NOT EXISTS idx_quality_task ON quality_marks(task_id);
 """
 
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_TABLE_COLUMNS: dict[str, set[str]] = {}
+for _match in re.finditer(r"CREATE TABLE IF NOT EXISTS (\w+) \((.*?)\);", SCHEMA, re.S):
+    _cols: set[str] = set()
+    for _line in _match.group(2).splitlines():
+        _line = _line.strip().rstrip(",")
+        if not _line or _line.upper().startswith(("FOREIGN", "UNIQUE", "PRIMARY", "CHECK")):
+            continue
+        _cols.add(_line.split()[0])
+    _TABLE_COLUMNS[_match.group(1)] = _cols
+
+
+def _require_table(name: str) -> str:
+    if name not in _TABLE_COLUMNS:
+        raise ValueError(f"不允许的表名: {name}")
+    return name
+
+
+def _require_column(table: str, column: str) -> str:
+    if not _IDENT.fullmatch(column) or column not in _TABLE_COLUMNS[table]:
+        raise ValueError(f"不允许的列名: {table}.{column}")
+    return column
+
+
+def _require_where(table: str, where: str) -> None:
+    if not where.strip():
+        return
+    parts = re.split(r"\s+AND\s+", where.strip(), flags=re.IGNORECASE)
+    for part in parts:
+        match = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)\s*=\s*\?", part.strip(), flags=re.IGNORECASE)
+        if not match:
+            raise ValueError(f"不允许的查询条件: {where}")
+        _require_column(table, match.group(1))
+
+
+def _require_order(table: str, order: str) -> None:
+    if not order.strip():
+        return
+    for piece in order.split(","):
+        match = re.fullmatch(
+            r"([A-Za-z_][A-Za-z0-9_]*)(?:\s+(?:ASC|DESC))?(?:\s+COLLATE\s+NOCASE)?",
+            piece.strip(),
+            flags=re.IGNORECASE,
+        )
+        if not match:
+            raise ValueError(f"不允许的排序: {order}")
+        _require_column(table, match.group(1))
+
 
 
 def _now() -> str:
@@ -289,10 +338,14 @@ class Store:
     # ----- generic helpers -----
 
     def get(self, table: str, row_id: str) -> dict[str, Any] | None:
+        table = _require_table(table)
         cur = self.connect().execute(f"SELECT * FROM {table} WHERE id = ?", (row_id,))
         return _row_to_dict(cur.fetchone())
 
     def list_rows(self, table: str, where: str = "", args: Iterable[Any] = (), order: str = "") -> list[dict[str, Any]]:
+        table = _require_table(table)
+        _require_where(table, where)
+        _require_order(table, order)
         sql = f"SELECT * FROM {table}"
         if where:
             sql += f" WHERE {where}"
@@ -307,7 +360,8 @@ class Store:
         fields = {k: v for k, v in fields.items() if k != "id"}
         if table in self._HAS_UPDATED and "updated_at" not in fields:
             fields["updated_at"] = _now()
-        keys = list(fields)
+        table = _require_table(table)
+        keys = [_require_column(table, key) for key in fields]
         if not keys:
             return self.get(table, row_id)
         assignments = ", ".join(f"{k} = ?" for k in keys)
@@ -318,6 +372,7 @@ class Store:
         return self.get(table, row_id)
 
     def insert(self, table: str, **fields: Any) -> dict[str, Any]:
+        table = _require_table(table)
         if "id" not in fields or not fields["id"]:
             fields["id"] = new_id()
         now = _now()
@@ -328,7 +383,7 @@ class Store:
             fields.setdefault("created_at", now)
         if table in {"dramas", "tasks", "characters"}:
             fields.setdefault("updated_at", now)
-        keys = list(fields)
+        keys = [_require_column(table, key) for key in fields]
         placeholders = ", ".join("?" for _ in keys)
         cols = ", ".join(keys)
         values = [_dump(fields[k]) for k in keys]
@@ -337,6 +392,7 @@ class Store:
         return self.get(table, fields["id"])  # type: ignore[return-value]
 
     def delete(self, table: str, row_id: str) -> None:
+        table = _require_table(table)
         with self.tx() as con:
             con.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
 

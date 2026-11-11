@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 from pathlib import Path
 from typing import Any, Protocol
 
@@ -108,7 +109,7 @@ def ensure_inswapper_weights(cfg: RecastConfig) -> Path:
         path = Path(downloaded)
         if path.is_file():
             if path.resolve() != dest.resolve():
-                dest.write_bytes(path.read_bytes())
+                shutil.copyfile(path, dest)
             return dest
     except Exception as exc:
         log.warning("Hugging Face 下载失败，改用直接 URL: %s", exc)

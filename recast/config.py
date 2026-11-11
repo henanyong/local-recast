@@ -51,6 +51,8 @@ class DetectConfig:
     tracker: str = "bytetrack.yaml"
     # Fill missing boxes across gaps no longer than this. Longer holes stay empty.
     max_gap_frames: int = 10
+    # The per-frame detection log is large. Off by default; tracks still keep their boxes.
+    keep_raw_frames: bool = False
 
 
 @dataclass

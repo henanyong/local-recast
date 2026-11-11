@@ -31,19 +31,42 @@ class CheckResult:
         return [m.name for m in self.missing]
 
 
+_IMAGE_RANK = {".png": 0, ".jpg": 1, ".jpeg": 2, ".webp": 3, ".bmp": 4}
+
+
+def _prefer_image(current: Path | None, candidate: Path) -> Path:
+    """Same stem: png beats jpg. A different filename is left to the caller."""
+    if current is None:
+        return candidate
+    current_rank = _IMAGE_RANK.get(current.suffix.lower(), 9)
+    candidate_rank = _IMAGE_RANK.get(candidate.suffix.lower(), 9)
+    return candidate if candidate_rank < current_rank else current
+
+
 def _index_images(folder: Path | None) -> dict[str, Path]:
     if folder is None or not folder.is_dir():
         return {}
     index: dict[str, Path] = {}
+
+    def _add(img: Path) -> None:
+        name = img.name.lower()
+        stem = img.stem.lower()
+        index[name] = _prefer_image(index.get(name), img) if name in index else img
+        index[stem] = _prefer_image(index.get(stem), img) if stem in index else img
+
     for img in iter_image_files(folder):
-        index[img.name.lower()] = img
-        index[img.stem.lower()] = img
-    # also search one level of nested folders
+        _add(img)
     for sub in folder.iterdir():
         if sub.is_dir():
             for img in iter_image_files(sub):
-                index.setdefault(img.name.lower(), img)
-                index.setdefault(img.stem.lower(), img)
+                name = img.name.lower()
+                stem = img.stem.lower()
+                if name not in index:
+                    index[name] = img
+                if stem not in index:
+                    index[stem] = img
+                else:
+                    index[stem] = _prefer_image(index.get(stem), img)
     return index
 
 

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -38,6 +39,20 @@ def is_skipped_dir(path: Path) -> bool:
     return path.name in SKIP_DIR_NAMES or path.name.startswith(".")
 
 
+_NUM = re.compile(r"(\d+)")
+
+
+def natural_sort_key(path: Path) -> tuple:
+    """Order 第2集 before 第10集 by comparing numeric segments as integers."""
+    pieces: list[tuple] = []
+    for part in _NUM.split(path.as_posix().lower()):
+        if part.isdigit():
+            pieces.append((0, int(part)))
+        else:
+            pieces.append((1, part))
+    return tuple(pieces)
+
+
 def list_videos(folder: Path, *, recursive: bool = False) -> list[Path]:
     if not folder.exists():
         return []
@@ -50,10 +65,10 @@ def list_videos(folder: Path, *, recursive: bool = False) -> list[Path]:
             continue
         if p.suffix.lower() not in VIDEO_EXTS:
             continue
-        if any(part in SKIP_DIR_NAMES for part in p.parts):
+        if any(part in SKIP_DIR_NAMES or part in REF_DIR_NAMES for part in p.parts):
             continue
         out.append(p)
-    return sorted(out, key=lambda x: x.as_posix().lower())
+    return sorted(out, key=natural_sort_key)
 
 
 def find_ref_dir(folder: Path) -> Path | None:
@@ -72,19 +87,37 @@ def find_video_dir(folder: Path) -> Path | None:
     return None
 
 
-def _episodes_in(folder: Path) -> list[EpisodeHit]:
-    videos: list[Path] = []
+def _episodes_in(folder: Path, *, nested: bool = False) -> list[EpisodeHit]:
+    """Videos in this folder, its 视频/ directory, and optionally season subfolders.
+
+    Nested mode is for one drama (第一季 / 第二季). The scan root stays shallow so
+    sibling shows are not merged into a single drama. Reference-image folders and
+    tool directories are skipped.
+    """
+    found: list[Path] = []
     video_dir = find_video_dir(folder)
     if video_dir is not None:
-        videos = list_videos(video_dir, recursive=True)
-    videos += [p for p in list_videos(folder, recursive=False) if p not in videos]
-    # also one level of non-special subfolders that only hold videos? keep shallow to avoid
-    # treating 参考图 as a video source (it shouldn't contain videos usually).
-    return [EpisodeHit(name=p.stem, video_path=p) for p in videos]
+        found.extend(list_videos(video_dir, recursive=True))
+    found.extend(p for p in list_videos(folder, recursive=False) if p not in found)
+    if nested:
+        try:
+            children = list(folder.iterdir())
+        except OSError:
+            children = []
+        for sub in children:
+            if not sub.is_dir() or is_skipped_dir(sub):
+                continue
+            if sub.name in REF_DIR_NAMES or sub.name in VIDEO_DIR_NAMES:
+                continue
+            for video in list_videos(sub, recursive=True):
+                if video not in found:
+                    found.append(video)
+    found = sorted(found, key=natural_sort_key)
+    return [EpisodeHit(name=p.stem, video_path=p) for p in found]
 
 
 def _as_drama(folder: Path, episodes: list[EpisodeHit] | None = None) -> DramaHit | None:
-    eps = episodes if episodes is not None else _episodes_in(folder)
+    eps = episodes if episodes is not None else _episodes_in(folder, nested=True)
     if not eps:
         return None
     roster_path = find_roster_file(folder)
