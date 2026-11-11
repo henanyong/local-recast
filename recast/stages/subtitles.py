@@ -75,14 +75,26 @@ def run(
         compute,
         lang or "auto",
     )
-    log.info("首次使用该模型时会从 Hugging Face 下载权重，请保持网络畅通。")
     vram_report("字幕-加载前")
-    model = WhisperModel(
-        cfg.whisper.model,
-        device=device,
-        compute_type=compute,
-        cpu_threads=cfg.cpu_threads,
-    )
+    model_kwargs = {
+        "device": device,
+        "compute_type": compute,
+        "cpu_threads": cfg.cpu_threads,
+    }
+    try:
+        # 本地已有缓存时不要再访问 Hugging Face，避免网络不通时一直卡住。
+        model = WhisperModel(cfg.whisper.model, local_files_only=True, **model_kwargs)
+        log.info("已使用本地 Whisper 缓存，未访问 Hugging Face。")
+    except Exception as exc:
+        log.warning("本地 Whisper 缓存不可用（%s），尝试联网下载。", exc)
+        log.info("若 huggingface.co 无法访问，这一步可能会长时间无响应。")
+        try:
+            model = WhisperModel(cfg.whisper.model, **model_kwargs)
+        except Exception as download_exc:
+            raise RuntimeError(
+                "无法加载 Whisper 模型：本地缓存不可用，且无法从 Hugging Face 下载。"
+                "请检查网络，或先把 faster-whisper 模型放到本机缓存后再试。"
+            ) from download_exc
     vram_report("字幕-已加载")
 
     segments_iter, info = model.transcribe(
