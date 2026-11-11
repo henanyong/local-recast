@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor, Future
 from dataclasses import dataclass, field
@@ -21,6 +22,16 @@ from recast.store.db import Store
 log = logging.getLogger("recast")
 
 ProgressFn = Callable[[str, str, float], None]
+PROGRESS_WRITE_INTERVAL = 0.2
+
+
+def should_persist_progress(last_write: float, now: float, fraction: float, interval: float = PROGRESS_WRITE_INTERVAL) -> bool:
+    """Database progress writes are coalesced. The first write and the final 100% always land."""
+    if last_write <= 0:
+        return True
+    if fraction >= 1.0:
+        return True
+    return (now - last_write) >= interval
 
 
 @dataclass
@@ -62,6 +73,7 @@ class Scheduler:
         self._running_ids: set[str] = set()
         self._executor: ThreadPoolExecutor | None = None
         self._futures: list[Future[Any]] = []
+        self._last_progress_at = 0.0
         self.current_task_id: str | None = None
         self.current_drama_id: str | None = None
         self.run_total = 0
@@ -95,7 +107,17 @@ class Scheduler:
                 pass
 
     def _cfg(self) -> RecastConfig:
-        return RecastConfig.from_yaml(resolve_config_path(self.settings.config_file()))
+        from recast.config import apply_runtime_settings
+
+        cfg = RecastConfig.from_yaml(resolve_config_path(self.settings.config_file()))
+        return apply_runtime_settings(cfg, self.settings)
+
+    def reap_futures(self) -> int:
+        """Drop completed worker futures so the list does not grow for the life of the process."""
+        with self._lock:
+            before = len(self._futures)
+            self._futures = [fut for fut in self._futures if not fut.done()]
+            return before - len(self._futures)
 
     def enqueue(self, jobs: list[Job]) -> int:
         n = 0
@@ -166,10 +188,12 @@ class Scheduler:
             self._running_ids.add(pick.task_id)
             assert self._executor is not None
             fut = self._executor.submit(self._run_job, pick)
+            self._futures = [item for item in self._futures if not item.done()]
             self._futures.append(fut)
             fut.add_done_callback(lambda _f: self._after())
 
     def _after(self) -> None:
+        self.reap_futures()
         if not stopping():
             self._pump()
         with self._lock:
@@ -204,6 +228,10 @@ class Scheduler:
         def on_progress(stage: str, message: str, fraction: float) -> None:
             self.current_pct = fraction
             self.current_progress = f"{stage} · {message}"
+            now = time.monotonic()
+            if not should_persist_progress(self._last_progress_at, now, fraction):
+                return
+            self._last_progress_at = now
             self.store.update(
                 "tasks",
                 job.task_id,

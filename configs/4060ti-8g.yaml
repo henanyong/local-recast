@@ -35,13 +35,26 @@ pose:
   mode: lightweight
   overlay: true
   export_smpl_hook: true
+  # accuracy = every frame + smoothing. speed = sample_every frames.
+  quality: accuracy
+  sample_every: 2
+  smooth: true
+  min_pose_iou: 0.3
 
 replace:
   backend: inswapper
   model: inswapper_128.onnx
   model_url: https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx
+  detect_every: 4
+  temporal_alpha: 0.62
+
+scene:
+  # One sensitivity for both cut detectors. 27 matches FFmpeg scene score 0.30.
+  threshold: 27
+  min_shot_sec: 0.4
 
 compose:
   crf: 18
+  use_nvenc: true
   audio: original
   burn_subs: false

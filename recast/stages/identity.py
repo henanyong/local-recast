@@ -339,6 +339,7 @@ def run(
         "cluster_threshold": cfg.identity.cluster_threshold,
         "persons": persons,
         "track_names": {str(k): v for k, v in track_names.items()},
+        "track_embeddings": {str(tid): [float(x) for x in means[tid]] for tid in means},
         "note": "未提供花名册时使用 Person_1 / Person_2 自动命名；可在 UI 或 --names 中改名。",
     }
     path = workdir / "identity.json"

@@ -213,14 +213,177 @@ def interpret_timing(video: dict, fmt: dict | None = None) -> tuple[float, int, 
     return float(fps), frame_count, is_vfr, float(duration)
 
 
-def ensure_constant_frame_rate(src: str | Path, dest: str | Path, fps: float) -> Path:
+# Shared re-encode quality. Callers pass this explicitly so a concat fallback
+# cannot silently drop to ffmpeg's libx264 default of CRF 23.
+DEFAULT_CRF = 18
+H264_SLOT = "{h264}"
+
+_nvenc_probe: bool | None = None
+
+
+def reset_nvenc_probe() -> None:
+    """Forget the cached NVENC probe (tests and a failed encode)."""
+    global _nvenc_probe
+    _nvenc_probe = None
+
+
+def set_nvenc_probe(value: bool | None) -> None:
+    global _nvenc_probe
+    _nvenc_probe = value
+
+
+def nvenc_available() -> bool:
+    """True when h264_nvenc is listed and a one-frame encode actually succeeds."""
+    global _nvenc_probe
+    if _nvenc_probe is not None:
+        return _nvenc_probe
+    try:
+        exe = which_ffmpeg()
+    except FFmpegError:
+        _nvenc_probe = False
+        return False
+    try:
+        listed = subprocess.run(
+            [exe, "-hide_banner", "-encoders"],
+            check=False,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+        )
+        if "h264_nvenc" not in (listed.stdout or ""):
+            _nvenc_probe = False
+            return False
+        trial = subprocess.run(
+            [
+                exe,
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-f",
+                "lavfi",
+                "-i",
+                "color=c=black:s=16x16:d=0.04",
+                "-frames:v",
+                "1",
+                "-c:v",
+                "h264_nvenc",
+                "-f",
+                "null",
+                "-",
+            ],
+            check=False,
+            text=True,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=8,
+        )
+        _nvenc_probe = trial.returncode == 0
+    except Exception as exc:
+        log.info("NVENC 探测失败，使用 libx264: %s", exc)
+        _nvenc_probe = False
+    return _nvenc_probe
+
+
+def h264_args(*, crf: int = DEFAULT_CRF, use_nvenc: bool = False) -> list[str]:
+    """Encoder arguments. NVENC uses -cq at the same quality number as libx264 -crf."""
+    quality = str(int(crf))
+    if use_nvenc:
+        return [
+            "-c:v",
+            "h264_nvenc",
+            "-pix_fmt",
+            "yuv420p",
+            "-rc",
+            "vbr",
+            "-cq",
+            quality,
+            "-b:v",
+            "0",
+        ]
+    return ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", quality, "-preset", "medium"]
+
+
+def expand_h264(args: Sequence[str], *, crf: int = DEFAULT_CRF, use_nvenc: bool = False) -> list[str]:
+    expanded: list[str] = []
+    for item in args:
+        if item == H264_SLOT:
+            expanded.extend(h264_args(crf=crf, use_nvenc=use_nvenc))
+        else:
+            expanded.append(str(item))
+    return expanded
+
+
+def _prefer_nvenc(use_nvenc: bool | None) -> bool:
+    if use_nvenc is False:
+        return False
+    return nvenc_available()
+
+
+def run_h264(
+    args: Sequence[str],
+    *,
+    crf: int = DEFAULT_CRF,
+    use_nvenc: bool | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run ffmpeg, preferring h264_nvenc and retrying once with libx264 on failure.
+
+    ``args`` may contain the ``{h264}`` slot. A command without the slot is run as-is.
+    """
+    if H264_SLOT not in args:
+        return run_ffmpeg(args)
+    want = _prefer_nvenc(use_nvenc)
+    try:
+        return run_ffmpeg(expand_h264(args, crf=crf, use_nvenc=want))
+    except FFmpegError:
+        if not want:
+            raise
+        log.warning("NVENC 编码失败，回退 libx264（CRF %s）。", int(crf))
+        set_nvenc_probe(False)
+        return run_ffmpeg(expand_h264(args, crf=crf, use_nvenc=False))
+
+
+def concat_copy_args(list_file: str | Path, dest: str | Path) -> list[str]:
+    return ["-y", "-f", "concat", "-safe", "0", "-i", str(list_file), "-c", "copy", str(dest)]
+
+
+def concat_reencode_args(list_file: str | Path, dest: str | Path) -> list[str]:
+    return ["-y", "-f", "concat", "-safe", "0", "-i", str(list_file), H264_SLOT, "-an", str(dest)]
+
+
+def run_concat(
+    list_file: str | Path,
+    dest: str | Path,
+    *,
+    crf: int = DEFAULT_CRF,
+    use_nvenc: bool | None = None,
+) -> Path:
+    """Stream-copy a concat list, and re-encode with the shared CRF if copy fails."""
+    try:
+        run_ffmpeg(concat_copy_args(list_file, dest))
+    except Exception:
+        log.warning("concat 复制失败，按 CRF %s 重新编码。", int(crf))
+        run_h264(concat_reencode_args(list_file, dest), crf=crf, use_nvenc=use_nvenc)
+    return Path(dest)
+
+
+def ensure_constant_frame_rate(
+    src: str | Path,
+    dest: str | Path,
+    fps: float,
+    *,
+    crf: int = DEFAULT_CRF,
+    use_nvenc: bool | None = None,
+) -> Path:
     """Transcode a VFR file to CFR so later stages can use frame indexes."""
     if fps <= 0:
         raise FFmpegError("无法把可变帧率转成恒定帧率：帧率未知。")
     out = Path(dest)
     out.parent.mkdir(parents=True, exist_ok=True)
     rate = f"{fps:.3f}".rstrip("0").rstrip(".")
-    run_ffmpeg(
+    run_h264(
         [
             "-i",
             str(src),
@@ -228,14 +391,13 @@ def ensure_constant_frame_rate(src: str | Path, dest: str | Path, fps: float) ->
             f"fps={rate}",
             "-r",
             rate,
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
+            H264_SLOT,
             "-c:a",
             "copy",
             str(out),
-        ]
+        ],
+        crf=crf,
+        use_nvenc=use_nvenc,
     )
     return out
 
@@ -272,8 +434,9 @@ def mux_av(
     subtitle: str | Path | None = None,
     *,
     burn_subs: bool = False,
-    crf: int = 18,
+    crf: int = DEFAULT_CRF,
     copy_audio: bool = True,
+    use_nvenc: bool | None = None,
 ) -> Path:
     """Mux video + optional audio and write sidecar / burned SRT."""
     out = Path(output)
@@ -288,7 +451,7 @@ def mux_av(
     if filters:
         args += ["-vf", ",".join(filters)]
 
-    args += ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", str(crf), "-preset", "medium"]
+    args += [H264_SLOT]
     if audio is not None and Path(audio).is_file():
         if copy_audio and not _needs_reencode_audio(Path(audio)):
             args += ["-c:a", "copy"]
@@ -298,7 +461,7 @@ def mux_av(
     else:
         args += ["-an"]
     args += ["-movflags", "+faststart", str(out)]
-    run_ffmpeg(args)
+    run_h264(args, crf=crf, use_nvenc=use_nvenc)
     return out
 
 
@@ -353,10 +516,19 @@ def copy_sidecar_srt(subtitle: str | Path, video_out: str | Path) -> Path | None
     return dest
 
 
-def open_ffmpeg_writer(path: str | Path, width: int, height: int, fps: float, crf: int = 18):
+def open_ffmpeg_writer(
+    path: str | Path,
+    width: int,
+    height: int,
+    fps: float,
+    crf: int = DEFAULT_CRF,
+    *,
+    use_nvenc: bool | None = None,
+):
     """Start an ffmpeg process that accepts raw BGR24 frames on stdin."""
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    codec = h264_args(crf=crf, use_nvenc=_prefer_nvenc(use_nvenc))
     cmd = [
         which_ffmpeg(),
         "-hide_banner",
@@ -376,14 +548,7 @@ def open_ffmpeg_writer(path: str | Path, width: int, height: int, fps: float, cr
         "-i",
         "-",
         "-an",
-        "-c:v",
-        "libx264",
-        "-pix_fmt",
-        "yuv420p",
-        "-crf",
-        str(crf),
-        "-preset",
-        "medium",
+        *codec,
         str(out),
     ]
     log.debug("ffmpeg writer: %s", " ".join(cmd))

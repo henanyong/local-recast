@@ -202,6 +202,9 @@ class InswapperBackend:
         frame: np.ndarray,
         target_bboxes: list[list[float]],
         source_faces: list[Any] | None = None,
+        *,
+        frame_idx: int = 0,
+        detect_every: int = 1,
     ) -> np.ndarray:
         if self._app is None or self._swapper is None:
             return frame
@@ -211,7 +214,8 @@ class InswapperBackend:
             if self._source_face is None:
                 return frame
             source_faces = [self._source_face] * len(target_bboxes)
-        faces = self._app.get(frame) or []
+        full = detection_plan(frame_idx, detect_every, True) == "full"
+        faces = collect_faces(self._app, frame, target_bboxes, full=full)
         if not faces:
             return frame
         from recast.stages.face_match import match_boxes
@@ -279,6 +283,195 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     if na <= 0 or nb <= 0:
         return 0.0
     return dot / (na * nb)
+
+
+def should_full_detect(frame_idx: int, every: int) -> bool:
+    return int(frame_idx) % max(1, int(every or 1)) == 0
+
+
+def detection_plan(frame_idx: int, every: int, has_boxes: bool) -> str:
+    """Full frame every N frames. Intermediate frames stay inside the track crop."""
+    if not has_boxes or should_full_detect(frame_idx, every):
+        return "full"
+    return "crop"
+
+
+def padded_crop(frame: np.ndarray, bbox: list[float], pad: float = 0.45) -> tuple[np.ndarray, int, int]:
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = [float(v) for v in bbox]
+    bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    left = max(0, int(x1 - bw * pad))
+    top = max(0, int(y1 - bh * pad))
+    right = min(width, int(x2 + bw * pad))
+    bottom = min(height, int(y2 + bh * pad))
+    if right <= left or bottom <= top:
+        return frame[0:1, 0:1].copy(), 0, 0
+    return frame[top:bottom, left:right], left, top
+
+
+def shift_detected_face(face: Any, ox: int, oy: int) -> Any:
+    """Move a crop-space detection back onto the full frame, including landmarks."""
+    bbox = getattr(face, "bbox", None)
+    if bbox is not None:
+        moved = np.array(bbox, dtype=np.float32, copy=True)
+        moved[0] += ox
+        moved[2] += ox
+        moved[1] += oy
+        moved[3] += oy
+        face.bbox = moved
+    kps = getattr(face, "kps", None)
+    if kps is not None:
+        moved_k = np.array(kps, dtype=np.float32, copy=True)
+        moved_k[:, 0] += ox
+        moved_k[:, 1] += oy
+        face.kps = moved_k
+    return face
+
+
+def detect_in_track_crops(app: Any, frame: np.ndarray, bboxes: list[list[float]], pad: float = 0.45) -> list[Any]:
+    found: list[Any] = []
+    for box in bboxes:
+        crop, ox, oy = padded_crop(frame, box, pad=pad)
+        if crop.shape[0] < 8 or crop.shape[1] < 8:
+            continue
+        for face in app.get(crop) or []:
+            found.append(shift_detected_face(face, ox, oy))
+    return found
+
+
+def collect_faces(app: Any, frame: np.ndarray, bboxes: list[list[float]], *, full: bool) -> list[Any]:
+    if full or not bboxes:
+        return list(app.get(frame) or [])
+    found = detect_in_track_crops(app, frame, bboxes)
+    if found:
+        return found
+    return list(app.get(frame) or [])
+
+
+def _clip_box(box: list[float], width: int, height: int) -> tuple[int, int, int, int] | None:
+    x1, y1, x2, y2 = [int(round(float(v))) for v in box]
+    x1 = max(0, min(width - 1, x1))
+    y1 = max(0, min(height - 1, y1))
+    x2 = max(0, min(width, x2))
+    y2 = max(0, min(height, y2))
+    if x2 <= x1 or y2 <= y1:
+        return None
+    return x1, y1, x2, y2
+
+
+def blend_tracked_region(
+    current: np.ndarray,
+    previous: np.ndarray,
+    cur_box: list[float],
+    prev_box: list[float],
+    alpha: float,
+) -> None:
+    """Blend the current face box with the previous box, resized onto the new position."""
+    height, width = current.shape[:2]
+    cur = _clip_box(cur_box, width, height)
+    prev_h, prev_w = previous.shape[:2]
+    prev = _clip_box(prev_box, prev_w, prev_h)
+    if cur is None or prev is None:
+        return
+    patch = current[cur[1] : cur[3], cur[0] : cur[2]]
+    src = previous[prev[1] : prev[3], prev[0] : prev[2]]
+    if patch.size == 0 or src.size == 0:
+        return
+    if src.shape[:2] != patch.shape[:2]:
+        src = cv2.resize(src, (patch.shape[1], patch.shape[0]), interpolation=cv2.INTER_LINEAR)
+    mixed = cv2.addWeighted(patch, float(alpha), src, 1.0 - float(alpha), 0.0)
+    current[cur[1] : cur[3], cur[0] : cur[2]] = mixed
+
+
+class SwapTemporalSmoother:
+    """Keep the swapped face from jumping independently on every frame."""
+
+    def __init__(self, alpha: float = 0.62) -> None:
+        self.alpha = float(alpha)
+        self.enabled = self.alpha < 0.999
+        self._prev_frame: np.ndarray | None = None
+        self._boxes: dict[int, list[float]] = {}
+
+    def apply(self, frame: np.ndarray, items: list[dict[str, Any]]) -> np.ndarray:
+        if not self.enabled:
+            return frame
+        out = frame
+        if self._prev_frame is not None:
+            out = frame.copy()
+            for item in items:
+                tid = item.get("track_id")
+                if tid is None:
+                    continue
+                prev = self._boxes.get(int(tid))
+                if prev is None:
+                    continue
+                blend_tracked_region(out, self._prev_frame, item["bbox"], prev, self.alpha)
+        self._prev_frame = np.ascontiguousarray(out).copy()
+        self._boxes = {}
+        for item in items:
+            if item.get("track_id") is None:
+                continue
+            self._boxes[int(item["track_id"])] = [float(v) for v in item["bbox"]]
+        return out
+
+
+def track_embedding_map(identity: dict[str, Any] | None) -> dict[int, list[float]]:
+    out: dict[int, list[float]] = {}
+
+    def _take(raw: Any) -> None:
+        if not isinstance(raw, dict):
+            return
+        for key, value in raw.items():
+            emb = as_embedding(value)
+            if not emb:
+                continue
+            try:
+                out[int(key)] = emb
+            except (TypeError, ValueError):
+                continue
+
+    _take((identity or {}).get("track_embeddings"))
+    for person in (identity or {}).get("persons") or []:
+        _take(person.get("track_embeddings"))
+    return out
+
+
+def split_tracks_by_identity(
+    reference: Any,
+    track_embeddings: dict[int, list[float]],
+    track_ids: list[int],
+    threshold: float,
+) -> tuple[list[int], list[dict[str, Any]]]:
+    """Drop a track whose own average face does not match the reference.
+
+    Tracks without an embedding stay. The cluster-level skip still applies
+    before this, so a weak reference is never swapped just because a track
+    embedding is missing.
+    """
+    kept: list[int] = []
+    rejected: list[dict[str, Any]] = []
+    ref = as_embedding(reference)
+    limit = float(threshold)
+    for tid in track_ids:
+        emb = track_embeddings.get(int(tid))
+        if ref is None or emb is None:
+            kept.append(int(tid))
+            continue
+        sim = cosine_similarity(ref, emb)
+        if sim < limit:
+            rejected.append(
+                {
+                    "track_id": int(tid),
+                    "score": sim,
+                    "reason": (
+                        f"轨迹 {int(tid)} 的平均人脸与参考脸相似度 {sim:.3f}，"
+                        f"低于 {limit:.2f}，已拒绝替换这条轨迹，避免换错人。"
+                    ),
+                }
+            )
+        else:
+            kept.append(int(tid))
+    return kept, rejected
 
 
 def match_similarity(identity: dict[str, Any] | None, override: float | None = None) -> float:
@@ -526,12 +719,29 @@ def plan_replace_targets(
             cluster_id=cluster_id,
             identity=identity,
         )
+        kept, rejected = split_tracks_by_identity(
+            ref.get("embedding"),
+            track_embedding_map(identity),
+            track_ids,
+            threshold,
+        )
+        if not kept:
+            reason = "；".join(str(row.get("reason") or "") for row in rejected) or "轨迹与参考脸不匹配，已拒绝替换。"
+            skipped.append(
+                {
+                    **_ref_brief(ref),
+                    "reason": reason,
+                    "score": rejected[0].get("score") if rejected else sim,
+                }
+            )
+            continue
         targets.append(
             {
                 **_ref_brief(ref),
                 "cluster_id": cluster_id,
                 "person_name": _person_name(person),
-                "track_ids": track_ids,
+                "track_ids": kept,
+                "rejected_tracks": rejected,
                 "score": sim,
             }
         )
@@ -674,6 +884,7 @@ def _public_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "cluster_id": row.get("cluster_id"),
             "person_name": row.get("person_name"),
             "track_ids": list(row.get("track_ids") or []),
+            "rejected_tracks": list(row.get("rejected_tracks") or []),
             "score": row.get("score"),
         }
 
@@ -813,10 +1024,23 @@ def run(
             max_gap=int(getattr(cfg.detect, "max_gap_frames", 10) or 10),
             fps=float(info.fps) if info.fps else None,
         )
+        for target in usable:
+            for row in target.get("rejected_tracks") or []:
+                log.error("已拒绝轨迹：%s", row.get("reason"))
         frames = index_swap_frames(track_payload, usable)
+        detect_every = max(1, int(getattr(cfg.replace, "detect_every", 1) or 1))
+        smoother = SwapTemporalSmoother(alpha=float(getattr(cfg.replace, "temporal_alpha", 0.62) or 0.62))
+        log.info("换脸检测：每 %s 帧全图检测一次，中间帧只在轨迹框内检测。", detect_every)
         out_path = workdir / "replaced.mp4"
         cap = open_capture(video)
-        writer = open_ffmpeg_writer(out_path, info.width, info.height, info.fps, crf=cfg.compose.crf)
+        writer = open_ffmpeg_writer(
+            out_path,
+            info.width,
+            info.height,
+            info.fps,
+            crf=cfg.compose.crf,
+            use_nvenc=cfg.compose.use_nvenc,
+        )
         total = info.frame_count or None
         pbar = tqdm(total=total, desc="替换", unit="f")
         frame_idx = 0
@@ -831,10 +1055,18 @@ def run(
                 if items:
                     boxes = [item["bbox"] for item in items]
                     sources = [prepared.get(item["source_key"]) for item in items]
-                    new_frame = backend.replace_frame(frame, boxes, sources)
+                    new_frame = backend.replace_frame(
+                        frame,
+                        boxes,
+                        sources,
+                        frame_idx=frame_idx,
+                        detect_every=detect_every,
+                    )
                     if new_frame is not frame:
                         swapped += 1
-                    frame = new_frame
+                        frame = smoother.apply(new_frame, items)
+                    else:
+                        frame = new_frame
                 if frame.shape[1] != info.width or frame.shape[0] != info.height:
                     frame = cv2.resize(frame, (info.width, info.height))
                 writer.stdin.write(np.ascontiguousarray(frame).tobytes())

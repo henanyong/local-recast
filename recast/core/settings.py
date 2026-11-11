@@ -50,6 +50,14 @@ class AppSettings:
     comfyui_url: str = ""
     default_pack: str = ""
     max_cps: float = 4.0
+    # None follows the yaml preset. The settings dialog writes an explicit value.
+    export_crf: int | None = None
+    use_nvenc: bool | None = None
+    scene_threshold: float | None = None
+    min_shot_sec: float | None = None
+    pose_quality: str = ""
+    pose_sample_every: int | None = None
+    detect_every: int | None = None
     cloud_volcengine: CloudChannel = field(default_factory=lambda: CloudChannel("火山引擎"))
     cloud_deepseek: CloudChannel = field(default_factory=lambda: CloudChannel("DeepSeek"))
     cloud_openai: CloudChannel = field(default_factory=lambda: CloudChannel("OpenAI 兼容"))

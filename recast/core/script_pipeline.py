@@ -110,6 +110,8 @@ def run_script_episode(
     progress: ProgressFn | None = None,
     output: str | Path | None = None,
     settings: Any | None = None,
+    crf: int = 18,
+    use_nvenc: bool | None = None,
 ) -> dict[str, Any]:
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
@@ -217,11 +219,25 @@ def run_script_episode(
                     except Exception as exc:
                         log.warning("ComfyUI 镜头 %s 失败，改用分镜预览成片: %s", code, exc)
                     refs = pack.resolve_shot_refs(sh)
-                    build_shot_clip(sh, clips_dir / f"{code}.mp4", refs=refs, width=specs["width"], height=specs["height"], fps=specs["fps"])
+                    build_shot_clip(
+                        sh,
+                        clips_dir / f"{code}.mp4",
+                        refs=refs,
+                        width=specs["width"],
+                        height=specs["height"],
+                        fps=specs["fps"],
+                        crf=crf,
+                        use_nvenc=use_nvenc,
+                    )
                     sh["animatic"] = True
                 from recast.generate.animatic import _concat
 
-                _concat([Path(s["output_path"]) for s in shots if s.get("output_path")], silent)
+                _concat(
+                    [Path(s["output_path"]) for s in shots if s.get("output_path")],
+                    silent,
+                    crf=crf,
+                    use_nvenc=use_nvenc,
+                )
                 rec["message"] = "ComfyUI 工作流（个别失败镜头已回退为分镜预览成片）"
                 rec["model"] = "comfyui"
             else:
@@ -233,12 +249,35 @@ def run_script_episode(
                         raise ValueError(f"找不到要重跑的镜头 {rerun_shot}")
                     refs = pack.resolve_shot_refs(target)
                     dest = workdir / "shots_silent" / f"{rerun_shot}.mp4"
-                    build_shot_clip(target, dest, refs=refs, width=specs["width"], height=specs["height"], fps=specs["fps"])
+                    build_shot_clip(
+                        target,
+                        dest,
+                        refs=refs,
+                        width=specs["width"],
+                        height=specs["height"],
+                        fps=specs["fps"],
+                        crf=crf,
+                        use_nvenc=use_nvenc,
+                    )
                     from recast.generate.animatic import _concat
 
-                    _concat([Path(s.get("output_path") or workdir / "shots_silent" / f"{s.get('shot_code')}.mp4") for s in shots], silent)
+                    _concat(
+                        [Path(s.get("output_path") or workdir / "shots_silent" / f"{s.get('shot_code')}.mp4") for s in shots],
+                        silent,
+                        crf=crf,
+                        use_nvenc=use_nvenc,
+                    )
                 else:
-                    result = build_animatic(shots, workdir, pack=pack, width=specs["width"], height=specs["height"], fps=specs["fps"])
+                    result = build_animatic(
+                        shots,
+                        workdir,
+                        pack=pack,
+                        width=specs["width"],
+                        height=specs["height"],
+                        fps=specs["fps"],
+                        crf=crf,
+                        use_nvenc=use_nvenc,
+                    )
                     silent = Path(result["silent"]) if result.get("silent") else silent
                 rec["message"] = ANIMATIC_NOTE
                 rec["model"] = "animatic"
@@ -295,6 +334,8 @@ def run_script_episode(
                 burn_subs=burn_subs,
                 precheck_dialogue=False,  # already checked
                 max_cps=max_cps,
+                crf=crf,
+                use_nvenc=use_nvenc,
             )
             rec["model"] = "ffmpeg+tts"
             summary.update(result)

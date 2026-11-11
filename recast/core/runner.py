@@ -410,7 +410,12 @@ def run_episode(
             check_cancel()
             from recast.stages import ingest
 
-            info, wav_path = ingest.run(video_alias, run_dir)
+            info, wav_path = ingest.run(
+                video_alias,
+                run_dir,
+                crf=int(cfg.compose.crf),
+                use_nvenc=bool(cfg.compose.use_nvenc),
+            )
             remember("ingest", [video_alias], [run_dir / "meta.json"])
         else:
             info = load_video_info(run_dir, video_alias) or info
@@ -425,12 +430,22 @@ def run_episode(
             check_cancel()
             from recast.extract.scenes import detect_scenes
 
-            payload = detect_scenes(video_alias, run_dir, info=info)
+            payload = detect_scenes(
+                video_alias,
+                run_dir,
+                info=info,
+                threshold=float(cfg.scene.threshold),
+                min_shot_sec=float(cfg.scene.min_shot_sec),
+            )
             if store is not None and task_id:
                 store.replace_shots(task_id, payload.get("shots") or [])
             remember("scenes", [video_alias], [shots_path])
-        shots = (_load_json(shots_path) or {}).get("shots") or []
+        scene_meta = _load_json(shots_path) or {}
+        shots = scene_meta.get("shots") or []
         summary["shots"] = len(shots)
+        if scene_meta.get("backend"):
+            summary["scene_backend"] = scene_meta.get("backend")
+            summary["scene_backend_label"] = scene_meta.get("backend_label")
 
         mark("extract", "语音转写（ASR）", 0.5)
         asr_json = run_dir / "subtitles.json"
@@ -735,7 +750,7 @@ def _run_export_stages(
                 srt=srt or (workdir / "subtitles.srt" if (workdir / "subtitles.srt").is_file() else None),
                 title=title,
             )
-            rec["message"] = f"成本表 {xlsx}；剪映工程 {jy}（未对具体剪映版本做打开验证）"
+            rec["message"] = f"成本表 {xlsx}；剪映草稿 {jy}（未打开剪映验证；同目录有 EDL 与 FCP XML）"
             result["cost_xlsx"] = str(xlsx)
             result["jianying"] = str(jy)
             _progress(progress, "export", rec["message"], 1.0)
@@ -823,6 +838,8 @@ def dispatch_job(
             progress=progress,
             output=output,
             settings=settings,
+            crf=int(getattr(getattr(config, "compose", None), "crf", 18) or 18),
+            use_nvenc=getattr(getattr(config, "compose", None), "use_nvenc", None),
         )
         # optional L1 replace on the generated silent/output picture joins here
         if "replace" in wanted and not skip_replace and (workdir / "silent.mp4").is_file():

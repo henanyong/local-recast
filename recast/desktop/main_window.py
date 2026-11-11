@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -57,6 +58,10 @@ from recast.desktop.prop_window import PropWindow
 COLS = ["选", "原名", "新名称", "集数", "状态", "进度", "成片", "创建时间"]
 
 
+class _SnapshotSignal(QObject):
+    ready = Signal(object)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, service: RecastService) -> None:
         super().__init__()
@@ -91,6 +96,11 @@ class MainWindow(QMainWindow):
         layout.addWidget(bottom, 2)
         layout.addWidget(self._build_stage_bar())
 
+        self._snap_signal = _SnapshotSignal()
+        self._snap_signal.ready.connect(self._apply_snapshot)
+        self._snap_busy = False
+        self._snap_again = False
+        self._snap_full = False
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(400)
@@ -303,8 +313,64 @@ class MainWindow(QMainWindow):
         item = self.table.item(row, 1)
         return item.data(Qt.ItemDataRole.UserRole) if item else None
 
+    def _scene_bit(self, engine: dict, scene_run: dict) -> str:
+        scene = engine.get("scene") or {}
+        threshold = scene_run.get("threshold", scene.get("threshold", 27))
+        min_shot = scene_run.get("min_shot_sec", scene.get("min_shot_sec", 0.4))
+        used = scene_run.get("backend_label") or scene_run.get("backend")
+        if used:
+            who = str(used)
+            prefix = "本次切镜"
+        elif scene.get("installed") == "pyscenedetect" or (engine.get("modules") or {}).get("scenedetect"):
+            who = "PySceneDetect"
+            prefix = "切镜"
+        else:
+            who = "FFmpeg 回退"
+            prefix = "切镜"
+        try:
+            number = float(threshold)
+            thr = str(int(number)) if number == int(number) else f"{number:.1f}"
+        except (TypeError, ValueError):
+            thr = str(threshold)
+        try:
+            shortest = f"{float(min_shot):.2f}"
+        except (TypeError, ValueError):
+            shortest = str(min_shot)
+        return f"{prefix}：{who}（阈值 {thr}，最短 {shortest}s）"
+
     def refresh(self, full: bool = False) -> None:
-        snap = self.service.snapshot(status_filter=self.filter.currentData())
+        """Queue a snapshot on a worker thread. The 400ms timer must not block the UI."""
+        if full:
+            self._snap_full = True
+        if self._snap_busy:
+            self._snap_again = True
+            return
+        self._snap_busy = True
+        want_full = self._snap_full
+        self._snap_full = False
+        status_filter = self.filter.currentData()
+
+        def work() -> None:
+            try:
+                snap = self.service.snapshot(status_filter=status_filter)
+                snap = dict(snap)
+                snap["_full"] = want_full
+            except Exception as exc:
+                snap = {"_error": str(exc), "_full": want_full}
+            self._snap_signal.ready.emit(snap)
+
+        threading.Thread(target=work, name="recast-ui-snapshot", daemon=True).start()
+
+    def _apply_snapshot(self, snap: dict) -> None:
+        self._snap_busy = False
+        if not snap.get("_error"):
+            self._paint(snap, full=bool(snap.get("_full")))
+        if self._snap_again or self._snap_full:
+            self._snap_again = False
+            self.refresh(full=self._snap_full)
+            self._snap_full = False
+
+    def _paint(self, snap: dict, full: bool = False) -> None:
         engine = snap.get("engine") or {}
         state = engine.get("state") or ENG_IDLE
         self.engine_label.setText(state)
@@ -329,7 +395,7 @@ class MainWindow(QMainWindow):
             f"PyTorch：{'OK' if mods.get('torch') else '缺失'}",
             f"Whisper：{'已安装' if mods.get('faster_whisper') else '未安装'}",
             f"InsightFace：{'已安装' if mods.get('insightface') else '未安装'}",
-            f"切镜：{'PySceneDetect' if mods.get('scenedetect') else 'FFmpeg 回退'}",
+            self._scene_bit(engine, snap.get("scene_run") or {}),
             f"OCR：{'RapidOCR' if mods.get('rapidocr') else '未安装（将只用 ASR）'}",
         ]
         missing_w = [m["label"] for m in models if not m.get("present") and m.get("key") == "inswapper_128"]
