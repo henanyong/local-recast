@@ -548,7 +548,8 @@ class RecastService:
         if not (ch.get("authorized") and ch.get("auth_type")):
             raise PermissionError("请先勾选授权，再生成 3D头像资产。")
         faces = photos or [a["path"] for a in (ch.get("assets") or []) if a.get("kind") == "face" and a.get("path") and Path(str(a["path"])).is_file()]
-        dest = bind_path_for(character_id, Path(self.settings.output_root) / "l2")
+        # bind_path_for appends l2/<id>. Passing output_root/l2 landed files in l2/l2/<id>.
+        dest = bind_path_for(character_id, self.settings.output_root)
         asset = build_avatar(
             character_id,
             faces,
@@ -568,6 +569,232 @@ class RecastService:
             )
         self._on_log("INFO", f"已为「{ch.get('display_name') or ch.get('name')}」生成 3D头像资产（可跨集复用，不是生产级完整网格）。")
         return asset
+
+    def delete_l2(self, character_id: str) -> dict[str, Any]:
+        """Delete one character's 3D头像资产 files and clear the database row.
+
+        Face, costume, and voice assets are left untouched. The path must be a
+        character folder inside the configured L2 output tree (canonical
+        ``output_root/l2/<id>`` or the legacy ``output_root/l2/l2/<id>``).
+        """
+        from recast.assets3d.avatar import L2PathError, remove_avatar_dir, require_l2_asset_dir
+
+        ch = self.store.get_character(character_id)
+        if not ch:
+            raise FileNotFoundError("找不到该人物。")
+        rows = [a for a in (ch.get("assets") or []) if a.get("kind") in {"3d", "3d_avatar"}]
+        if not rows:
+            raise FileNotFoundError("该人物没有 3D头像资产。")
+
+        planned: list[tuple[dict[str, Any], Path | None]] = []
+        for row in rows:
+            raw = row.get("path")
+            if not raw:
+                planned.append((row, None))
+                continue
+            try:
+                dest = require_l2_asset_dir(raw, self.settings.output_root)
+            except L2PathError as exc:
+                raise PermissionError(str(exc)) from exc
+            planned.append((row, dest))
+
+        protected = self._protected_asset_paths()
+        removed: list[str] = []
+        seen: set[Path] = set()
+        for row, dest in planned:
+            if dest is not None and dest not in seen:
+                remove_avatar_dir(dest, protected=protected)
+                removed.append(str(dest))
+                seen.add(dest)
+            self.store.delete("character_assets", row["id"])
+        name = ch.get("display_name") or ch.get("name") or character_id
+        self._on_log("INFO", f"已删除「{name}」的 3D头像资产。人脸照片仍保留，3D 状态为「缺失」。")
+        return {
+            "character_id": character_id,
+            "display_name": name,
+            "removed": removed,
+            "status": "缺失",
+        }
+
+    def list_unused_l2(self) -> list[dict[str, Any]]:
+        """List 3D头像 folders under the L2 tree that nothing still references.
+
+        Includes unreferenced folders, leftovers on the doubled ``l2/l2`` path,
+        and folders whose character row is gone. Referenced assets, and
+        anything outside the L2 tree, are omitted.
+        """
+        from recast.assets3d.avatar import L2PathError, iter_l2_asset_dirs, load_avatar, require_l2_asset_dir
+
+        output_root = self.settings.output_root
+        characters = {c["id"]: c for c in self.store.list_characters()}
+        referenced: set[Path] = set()
+        dangling: list[dict[str, Any]] = []
+        for row in self.store.list_rows("character_assets"):
+            if row.get("kind") not in {"3d", "3d_avatar"}:
+                continue
+            if row.get("character_id") not in characters:
+                dangling.append(row)
+                continue
+            raw = row.get("path")
+            if not raw:
+                continue
+            try:
+                dest = require_l2_asset_dir(raw, output_root)
+            except L2PathError:
+                continue
+            referenced.add(dest)
+
+        items: list[dict[str, Any]] = []
+        by_path: dict[Path, dict[str, Any]] = {}
+
+        def _add(folder: Path, *, legacy: bool, row_id: str | None = None) -> None:
+            try:
+                resolved = require_l2_asset_dir(folder, output_root)
+            except L2PathError:
+                return
+            existing = by_path.get(resolved)
+            if existing is not None:
+                if row_id and row_id not in existing["asset_row_ids"]:
+                    existing["asset_row_ids"].append(row_id)
+                return
+            if resolved in referenced:
+                return
+            meta = load_avatar(resolved) or {}
+            meta_id = str(meta.get("character_id") or "")
+            cid = meta_id or folder.name
+            display = str(meta.get("display_name") or "")
+            character = characters.get(cid)
+            if character and not display:
+                display = str(character.get("display_name") or character.get("name") or "")
+            if legacy:
+                reason = "旧路径残留（l2/l2），未被引用"
+            elif meta_id and meta_id not in characters:
+                reason = "对应人物已不存在"
+            else:
+                reason = "未被任何人物引用"
+            item = {
+                "character_id": cid,
+                "display_name": display,
+                "name": display or cid,
+                "path": str(resolved),
+                "reason": reason,
+                "legacy": legacy,
+                "asset_row_ids": [row_id] if row_id else [],
+            }
+            items.append(item)
+            by_path[resolved] = item
+
+        for folder, legacy in iter_l2_asset_dirs(output_root):
+            _add(folder, legacy=legacy)
+
+        for row in dangling:
+            raw = row.get("path") or ""
+            if not raw:
+                items.append(
+                    {
+                        "character_id": str(row.get("character_id") or ""),
+                        "display_name": "",
+                        "name": str(row.get("character_id") or "未知人物"),
+                        "path": "",
+                        "reason": "对应人物已不存在",
+                        "legacy": False,
+                        "asset_row_ids": [row["id"]],
+                    }
+                )
+                continue
+            try:
+                dest = require_l2_asset_dir(raw, output_root)
+            except L2PathError:
+                continue
+            if dest in referenced:
+                continue
+            _add(dest, legacy=len(dest.relative_to(Path(output_root).expanduser().resolve() / "l2").parts) == 2, row_id=row["id"])
+
+        items.sort(key=lambda item: (item.get("name") or "", item.get("path") or ""))
+        return items
+
+    def delete_unused_l2(self, only: list[str] | None = None) -> dict[str, Any]:
+        """Delete unused 3D头像资产 currently listed by :meth:`list_unused_l2`.
+
+        ``only`` limits the delete to paths the user already confirmed. Paths
+        outside the L2 tree are ignored. Still-referenced assets are skipped
+        even if a caller names them.
+        """
+        from recast.assets3d.avatar import L2PathError, l2_tree_root, remove_avatar_dir, require_l2_asset_dir
+
+        items = self.list_unused_l2()
+        if only is not None:
+            allowed: set[str] = set()
+            include_pathless = False
+            for raw in only:
+                if not raw:
+                    include_pathless = True
+                    continue
+                try:
+                    allowed.add(str(require_l2_asset_dir(raw, self.settings.output_root)))
+                except L2PathError:
+                    continue
+            selected: list[dict[str, Any]] = []
+            for item in items:
+                path = item.get("path") or ""
+                if path and str(Path(path).resolve()) in allowed:
+                    selected.append(item)
+                elif not path and include_pathless:
+                    selected.append(item)
+            items = selected
+
+        planned: list[tuple[dict[str, Any], Path | None]] = []
+        for item in items:
+            raw = item.get("path") or ""
+            dest: Path | None = None
+            if raw:
+                try:
+                    dest = require_l2_asset_dir(raw, self.settings.output_root)
+                except L2PathError:
+                    continue
+            planned.append((item, dest))
+
+        protected = self._protected_asset_paths()
+        removed: list[dict[str, Any]] = []
+        for item, dest in planned:
+            if dest is not None:
+                remove_avatar_dir(dest, protected=protected)
+            for row_id in item.get("asset_row_ids") or []:
+                self.store.delete("character_assets", row_id)
+            removed.append(
+                {
+                    "character_id": item.get("character_id") or "",
+                    "display_name": item.get("display_name") or "",
+                    "name": item.get("name") or item.get("character_id") or "",
+                    "path": item.get("path") or "",
+                    "reason": item.get("reason") or "",
+                }
+            )
+        doubled = l2_tree_root(self.settings.output_root) / "l2"
+        try:
+            if doubled.is_dir() and not doubled.is_symlink() and not any(doubled.iterdir()):
+                doubled.rmdir()
+        except OSError:
+            pass
+        self._on_log("INFO", f"已清理 {len(removed)} 个未使用的 3D头像资产。")
+        return {"count": len(removed), "removed": removed}
+
+    def _protected_asset_paths(self) -> set[Path]:
+        """Face, costume, and voice files that cleanup must not unlink."""
+        kept: set[Path] = set()
+        for row in self.store.list_rows("character_assets"):
+            if row.get("kind") not in {"face", "costume", "voice"}:
+                continue
+            raw = row.get("path")
+            if not raw:
+                continue
+            path = Path(str(raw)).expanduser()
+            try:
+                if path.exists():
+                    kept.add(path.resolve())
+            except OSError:
+                continue
+        return kept
 
     def generate_prop(self, dest_dir: str | Path, prompt: str = "", image: str | None = None) -> dict[str, Any]:
         from recast.assets3d.gen3d import generate_prop
