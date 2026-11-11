@@ -921,12 +921,29 @@ def dispatch_job(
     if "dub" in wanted and entry_type != "script":
         log.info("导入视频的音轨已在合成导出阶段处理，已跳过单独贴轨。")
 
-    # quality marks after replace
+    # quality marks after replace, including swapped-face vs reference similarity
     if store and task_id and "replace" in wanted:
-        from recast.quality.review import run_quality_checks
+        from recast.pipeline import load_track_payload
+        from recast.quality.face_review import post_replace_review_items, try_embed_sample
 
         shots = store.shots_for_task(task_id)
-        items = run_quality_checks(shots)
+        work = Path(workdir)
+        plan_path = work / "replace_plan.json"
+        plan = _load_json(plan_path) if plan_path.is_file() else {}
+        track_payload = load_track_payload(work) or {}
+        replaced = work / "replaced.mp4"
+        thumbs = work / "review_thumbs"
+
+        def _embed(sample: dict) -> tuple[list[float], list[float]] | None:
+            return try_embed_sample(sample, replaced if replaced.is_file() else None)
+
+        items = post_replace_review_items(
+            shots,
+            track_payload,
+            plan if isinstance(plan, dict) else {},
+            _embed,
+            thumbnail_dir=thumbs,
+        )
         for it in items:
             store.insert(
                 "quality_marks",
@@ -936,6 +953,8 @@ def dispatch_job(
                 reason=it.reason,
                 detail=it.detail,
                 status="待人工检查",
+                score=it.score,
+                thumbnail=it.thumbnail,
             )
         if items:
             log.warning("质量检查标记了 %s 个镜头，请在终检窗口查看。", len(items))
