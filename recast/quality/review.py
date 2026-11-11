@@ -19,6 +19,7 @@ class ReviewItem:
     detail: str = ""
     shot_id: str | None = None
     score: float | None = None
+    thumbnail: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -27,6 +28,7 @@ class ReviewItem:
             "detail": self.detail,
             "shot_id": self.shot_id,
             "score": self.score,
+            "thumbnail": self.thumbnail,
         }
 
 
@@ -58,13 +60,19 @@ def check_face_drift(
         sim = cosine_similarity(lib, obs)
         if sim < threshold:
             code = str(p.get("shot_code") or p.get("shot_id") or "")
+            who = p.get("person_name") or p.get("name") or ""
+            who_bit = f"「{who}」" if who else "换后的脸"
             items.append(
                 ReviewItem(
                     shot_code=code,
                     reason="人脸特征漂移",
-                    detail=f"与人物库相似度 {sim:.3f}，低于阈值 {threshold:.2f}，请人工确认是否换错脸或串人。",
+                    detail=(
+                        f"{who_bit}与参考脸相似度 {sim:.3f}，低于阈值 {threshold:.2f}。"
+                        "请看缩略图确认是否换错脸，并可单镜重跑。"
+                    ),
                     shot_id=p.get("shot_id"),
                     score=sim,
+                    thumbnail=p.get("thumbnail"),
                 )
             )
     return items

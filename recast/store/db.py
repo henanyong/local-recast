@@ -203,7 +203,9 @@ CREATE TABLE IF NOT EXISTS quality_marks (
     reason TEXT,
     detail TEXT,
     status TEXT,
-    created_at TEXT
+    created_at TEXT,
+    score REAL,
+    thumbnail TEXT
 );
 
 CREATE TABLE IF NOT EXISTS schema_meta (

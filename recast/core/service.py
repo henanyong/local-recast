@@ -486,6 +486,11 @@ class RecastService:
                 items.extend(self.store.quality_for_task(t["id"]))
         return items
 
+    def set_review_status(self, mark_id: str, status: str) -> dict[str, Any] | None:
+        if status not in {"待人工检查", "已通过", "已忽略"}:
+            raise ValueError("终检状态只能是待人工检查、已通过或已忽略。")
+        return self.store.update("quality_marks", mark_id, status=status)
+
     def rerun_shot(self, task_id: str, shot_code: str) -> dict[str, Any]:
         task = self.store.get("tasks", task_id)
         if not task:

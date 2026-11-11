@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Columns added in the V0.5 / V1.0 upgrade (version 2).
 _V2_COLUMNS: dict[str, list[tuple[str, str]]] = {
@@ -151,6 +151,11 @@ def migrate(con: sqlite3.Connection) -> int:
     if version < 2:
         _migrate_to_2(con)
         version = 2
+    if version < 3:
+        if _table_exists(con, "quality_marks"):
+            _add_column(con, "quality_marks", "score", "REAL")
+            _add_column(con, "quality_marks", "thumbnail", "TEXT")
+        version = 3
     _set_version(con, SCHEMA_VERSION)
     con.commit()
     return SCHEMA_VERSION
