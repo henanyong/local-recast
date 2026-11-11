@@ -180,7 +180,7 @@ def _cmd_doctor(args: argparse.Namespace) -> int:
         ("mediapipe", "mediapipe（姿态回退）"),
         ("openpyxl", "openpyxl（成本表 xlsx）"),
         ("cryptography", "cryptography（云密钥加密，缺了会用本地密钥文件）"),
-        ("edge_tts", "edge-tts（可选本地配音，缺了可导入 wav 或只出 SRT）"),
+        ("edge_tts", "edge-tts（微软在线语音，不是本地引擎；离线请用 piper 模型或导入 wav）"),
     ]
     print("-" * 48)
     print("依赖检查（不下载模型）:")

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from recast.ffmpeg import copy_sidecar_srt, run_ffmpeg
-from recast.templates.duration import check_shots
+from recast.templates.duration import check_shots, extend_timeline_for_audio
 
 log = logging.getLogger("recast")
 
@@ -159,6 +159,12 @@ def stitch_and_dub(
     if not silent_path.is_file():
         raise FileNotFoundError("还没有静音画面，请先完成「按剧本生成（先静音）」。")
 
+    # Real wav length, not the character-count estimate. Later shots move back
+    # so two lines are not mixed on top of each other. Audio is not sped up.
+    confirmations = extend_timeline_for_audio(shots)
+    for note in confirmations:
+        log.warning("%s", note["message"])
+
     # total duration from shots
     last_end = 0.0
     for sh in shots:
@@ -218,4 +224,5 @@ def stitch_and_dub(
         "silent": str(silent_path),
         "audio": str(audio) if audio and Path(audio).is_file() else None,
         "segments": len(segs),
+        "confirmations": confirmations,
     }
