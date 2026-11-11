@@ -1,0 +1,37 @@
+# PyTorch + CUDA must be installed first (see scripts/install_windows.bat).
+# Official CUDA 12.4 wheels:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# CUDA 12.6 alternative:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+faster-whisper>=1.1.1,<2
+ultralytics>=8.3.0,<9
+insightface>=0.7.3,<0.8
+onnxruntime-gpu>=1.20.0,<1.21
+opencv-python>=4.10.0,<5
+numpy>=1.26.0,<2.2
+Pillow>=10.4.0
+PyYAML>=6.0.2
+tqdm>=4.66.5
+scikit-learn>=1.5.0
+huggingface_hub>=0.26.0
+colorama>=0.4.6
+PySide6>=6.6.0
+scenedetect>=0.6.4,<0.7
+
+# Optional pose backends (pipeline falls back if missing)
+rtmlib>=0.0.13
+mediapipe>=0.10.14,<0.11
+
+# Web / simple UI fallbacks
+gradio>=5.0.0,<6
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+
+# Dev tests (safe to install on the build box; not required at runtime)
+pytest>=8.0.0
+
+# V0.5 / V1.0
+openpyxl>=3.1.0
+cryptography>=42.0.0

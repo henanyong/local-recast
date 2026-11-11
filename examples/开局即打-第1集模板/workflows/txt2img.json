@@ -1,0 +1,11 @@
+{
+  "note": "示例工作流骨架。若本机 ComfyUI 可连，程序会替换 ${prompt}/${width}/${height} 后提交；否则走分镜预览成片。",
+  "6": {
+    "inputs": {
+      "text": "${prompt}",
+      "width": "${width}",
+      "height": "${height}"
+    },
+    "class_type": "Placeholder"
+  }
+}

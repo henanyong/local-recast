@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>本地再铸工作台</title>
+  <link rel="stylesheet" href="/static/app.css" />
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="brand">
+        <span class="mark">RC</span>
+        <div>
+          <h1>本地再铸工作台</h1>
+          <p>local-recast · 本地字幕 / 跟踪 / 关键点 / 换脸</p>
+        </div>
+      </div>
+      <div class="top-meta">
+        <span class="chip">i5-12600KF</span>
+        <span class="chip accent">4060 Ti · 默认 8GB 配置</span>
+        <span id="run-indicator" class="chip idle">空闲</span>
+      </div>
+    </header>
+
+    <section class="toolbar">
+      <label class="path-field">
+        <span>扫描目录</span>
+        <input id="scan-path" type="text" placeholder="选择或粘贴本地目录，例如 D:\剧集\第一季" />
+      </label>
+      <button type="button" id="btn-browse" class="btn">浏览…</button>
+      <button type="button" id="btn-scan" class="btn btn-primary">扫描</button>
+      <div class="toolbar-gap"></div>
+      <button type="button" id="btn-start" class="btn btn-primary">开始执行</button>
+      <button type="button" id="btn-stop" class="btn btn-danger">停止当前</button>
+      <button type="button" id="btn-clear" class="btn">清除已完成</button>
+      <button type="button" id="btn-remove" class="btn">移除勾选</button>
+      <div class="overall">
+        <div class="overall-label">总进度 <strong id="overall-text">0 / 0</strong></div>
+        <div class="bar"><i id="overall-bar"></i></div>
+      </div>
+    </section>
+
+    <main class="workspace">
+      <section class="queue-panel">
+        <div class="panel-head">
+          <h2>任务队列</h2>
+          <span id="queue-count" class="muted">0 项</span>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th class="col-check"><input type="checkbox" id="check-all" /></th>
+                <th>名称</th>
+                <th class="col-eps">集数</th>
+                <th class="col-status">状态</th>
+                <th>进度</th>
+                <th class="col-out">输出</th>
+                <th class="col-time">创建时间</th>
+              </tr>
+            </thead>
+            <tbody id="task-body">
+              <tr class="empty-row"><td colspan="7">选择一个目录并扫描，视频和分集文件夹会进入队列。</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <aside class="settings-panel">
+        <div class="panel-head">
+          <h2>任务设置</h2>
+        </div>
+        <p id="settings-hint" class="muted">选中一行后，为该任务指定参考脸、人名花名册和显存配置。</p>
+        <form id="settings-form" hidden>
+          <div class="field">
+            <label>任务</label>
+            <div id="sel-name" class="readonly"></div>
+          </div>
+          <div class="field">
+            <label>参考脸 / 角色图</label>
+            <div class="file-row">
+              <input id="set-face" type="text" placeholder="本地图片路径，替换合成需要" />
+              <button type="button" id="btn-face-browse" class="btn btn-sm">浏览</button>
+              <label class="btn btn-sm file-btn">上传<input id="set-face-file" type="file" accept="image/*" hidden /></label>
+            </div>
+          </div>
+          <div class="field">
+            <label>人名花名册（可选）</label>
+            <div class="file-row">
+              <input id="set-names" type="text" placeholder="YAML 路径，或 1=张三,2=李四" />
+              <button type="button" id="btn-names-browse" class="btn btn-sm">浏览</button>
+              <label class="btn btn-sm file-btn">上传<input id="set-names-file" type="file" accept=".yaml,.yml,.txt" hidden /></label>
+            </div>
+          </div>
+          <div class="field">
+            <label>显存配置</label>
+            <select id="set-config"></select>
+          </div>
+          <div class="field-row">
+            <label class="check"><input id="set-burn" type="checkbox" /> 烧录字幕</label>
+            <label>语言
+              <select id="set-lang">
+                <option value="auto">自动</option>
+                <option value="zh">中文</option>
+                <option value="en">英语</option>
+                <option value="ja">日语</option>
+                <option value="ko">韩语</option>
+              </select>
+            </label>
+          </div>
+          <div class="field">
+            <label>目标轨迹 ID（可选）</label>
+            <input id="set-track" type="number" min="1" placeholder="默认选出现最多的人" />
+          </div>
+          <div class="btn-row">
+            <button type="button" id="btn-save" class="btn btn-primary">保存设置</button>
+            <button type="button" id="btn-apply" class="btn">应用到勾选</button>
+          </div>
+        </form>
+      </aside>
+    </main>
+
+    <section class="stage-dock">
+      <div class="dock-label">阶段 · 可全部按序执行，也可只跑勾选任务的某一段</div>
+      <div class="stage-buttons" id="stage-buttons"></div>
+      <label class="check" style="margin: 8px 0 0 0; display: inline-flex; align-items: center; gap: 6px;">
+        <input id="set-force" type="checkbox" /> 强制重跑（忽略已有产物）
+      </label>
+      <button type="button" id="btn-all-stages" class="btn btn-primary btn-wide">全部阶段按序执行</button>
+    </section>
+
+    <section class="log-panel">
+      <div class="panel-head">
+        <h2>运行日志</h2>
+        <div class="log-actions">
+          <label class="check"><input id="log-follow" type="checkbox" checked /> 跟随滚动</label>
+          <button type="button" id="btn-log-clear" class="btn btn-sm">清空显示</button>
+        </div>
+      </div>
+      <pre id="log-view" class="log-view"></pre>
+    </section>
+  </div>
+
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card">
+      <header>
+        <h3 id="modal-title">选择目录</h3>
+        <button type="button" id="modal-close" class="btn btn-sm">关闭</button>
+      </header>
+      <div class="crumbs" id="modal-path"></div>
+      <div class="browser" id="modal-list"></div>
+      <footer>
+        <button type="button" id="modal-up" class="btn">上级目录</button>
+        <button type="button" id="modal-choose" class="btn btn-primary">选择此目录</button>
+      </footer>
+    </div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

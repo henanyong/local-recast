@@ -1,0 +1,14 @@
+{
+  "id": "wen_nian",
+  "name": "温念",
+  "level": "character",
+  "face": "01-温念.jpg",
+  "faces": [
+    "01-温念.jpg",
+    "01-温念-冷笑.jpg"
+  ],
+  "costume": "军绿旧外套罩香槟丝质V领睡裙",
+  "voice": "",
+  "l2_asset": null,
+  "style_words": "20岁出头东亚女性，精致瓜子脸，冷冽深瞳，凌乱湿感长黑发，气质清醒狠厉"
+}

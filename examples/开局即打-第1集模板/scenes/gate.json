@@ -1,0 +1,9 @@
+{
+  "id": "gate",
+  "name": "破旧木门外",
+  "level": "scene",
+  "plate": "",
+  "lighting": "门外自然光",
+  "palette": "土黄灰调",
+  "camera": "中景、近景、对切特写"
+}

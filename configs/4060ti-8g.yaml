@@ -1,0 +1,47 @@
+# Conservative defaults for RTX 4060 Ti 8GB. This is the recommended starting config.
+# Never load two heavy models at once; the pipeline unloads and clears CUDA cache
+# between stages.
+
+device: cuda
+vram_gb: 8
+# 12600KF has 6P+4E / 16 threads. Leave headroom for the UI and desktop.
+cpu_threads: 4
+opencv_threads: 2
+
+whisper:
+  model: small
+  compute_type: float16
+  device: cuda
+  beam_size: 1
+  vad_filter: true
+
+detect:
+  model: yolo11n.pt
+  imgsz: 640
+  conf: 0.4
+  iou: 0.5
+  tracker: bytetrack.yaml
+
+identity:
+  model: buffalo_s
+  det_size: 512
+  cluster_threshold: 0.45
+  max_faces_per_track: 24
+  sample_every: 5
+
+pose:
+  # auto: rtmlib (RTMPose lightweight) -> YOLO-pose -> MediaPipe
+  backend: auto
+  mode: lightweight
+  overlay: true
+  export_smpl_hook: true
+
+replace:
+  backend: inswapper
+  model: inswapper_128.onnx
+  model_url: https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx
+
+compose:
+  crf: 18
+  audio: original
+  burn_subs: false

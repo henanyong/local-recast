@@ -1,0 +1,13 @@
+{
+  "id": "wen_xue",
+  "name": "温雪",
+  "level": "character",
+  "face": "03-温雪.jpg",
+  "faces": [
+    "03-温雪.jpg"
+  ],
+  "costume": "双长黑辫红绳，明黄粉花短袖旗袍盘扣",
+  "voice": "",
+  "l2_asset": null,
+  "style_words": "少女，娇蛮护妈，是攻击方不是保护方"
+}

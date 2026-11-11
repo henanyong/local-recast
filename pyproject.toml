@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "recast"
+version = "1.0.0"
+description = "本地再铸 V1.0：导入现成视频或按剧本生成，四级模板、成本表、剪映导出，以及 L2 3D头像 / L3 3D道具试点。"
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+authors = [{ name = "local-recast" }]
+
+[project.scripts]
+recast = "recast.__main__:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+ocr = ["rapidocr>=2.0"]
+web = ["fastapi>=0.115.0", "uvicorn[standard]>=0.32.0", "gradio>=5.0.0,<6"]
+
+[tool.setuptools.packages.find]
+include = ["recast*"]
+
+[tool.setuptools.package-data]
+recast = ["workbench_static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

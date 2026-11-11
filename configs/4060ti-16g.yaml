@@ -1,0 +1,46 @@
+# For 16GB 4060 Ti cards only. Uses a larger Whisper model and a slightly
+# higher detection size. Still unloads models between stages.
+# Full Wan2.2 / AniCrafter replacement is NOT enabled here; those remain
+# optional future work even on 16GB.
+
+device: cuda
+vram_gb: 16
+cpu_threads: 4
+opencv_threads: 2
+
+whisper:
+  model: medium
+  compute_type: float16
+  device: cuda
+  beam_size: 3
+  vad_filter: true
+
+detect:
+  model: yolo11n.pt
+  imgsz: 960
+  conf: 0.35
+  iou: 0.5
+  tracker: bytetrack.yaml
+
+identity:
+  model: buffalo_s
+  det_size: 640
+  cluster_threshold: 0.45
+  max_faces_per_track: 36
+  sample_every: 3
+
+pose:
+  backend: auto
+  mode: balanced
+  overlay: true
+  export_smpl_hook: true
+
+replace:
+  backend: inswapper
+  model: inswapper_128.onnx
+  model_url: https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx
+
+compose:
+  crf: 17
+  audio: original
+  burn_subs: false

@@ -1,0 +1,22 @@
+# 人名花名册（可选）
+# 简单写法（键可以是编号或 Person_1）。程序会在「参考图」目录查找 5.png / 5.jpg / 沈黛.png 等：
+#
+#   5: 沈黛
+#   6: 男主
+#
+# 详细写法可以显式指定参考文件（缺了会按文件名提示，例如「缺少 hero.png」）：
+#
+# characters:
+#   - id: 5
+#     name: 沈黛
+#     face: 5.png
+#     costume: 5_costume.png
+#     voice: 5.wav
+#
+# 命令行：
+#   python -m recast process INPUT.mp4 --names examples/names.yaml
+#   python -m recast process INPUT.mp4 --names "1=张三,2=李四"
+
+1: 主角
+2: 配角A
+# Person_1: 主角
