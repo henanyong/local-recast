@@ -438,7 +438,13 @@ def run_episode(
             check_cancel()
             from recast.extract import asr
 
-            srt_path, sub_json, segments = asr.run(wav_path, run_dir, cfg, language=lang)
+            srt_path, sub_json, segments = asr.run(
+                wav_path,
+                run_dir,
+                cfg,
+                language=lang,
+                names=list(roster_map.values()),
+            )
             if store is not None and task_id:
                 store.replace_subtitles(task_id, "asr", segments)
             remember("asr", [p for p in (wav_path, video_alias) if p and Path(p).exists()], [asr_json, run_dir / "subtitles.srt"])
@@ -463,9 +469,18 @@ def run_episode(
         merged_json = run_dir / "subtitles_merged.json"
         if not maybe_skip("merge", [asr_json, ocr_json], [merged_json, run_dir / "subtitles.srt"]):
             from recast.extract.merge_subs import merge_subtitles
-            from recast.stages.subtitles import write_srt
+            from recast.stages.subtitles import filter_no_speech, snap_segments_to_shots, write_srt
 
             asr_segs = ((_load_json(asr_json) or {}).get("segments")) or segments
+            asr_segs = filter_no_speech(
+                asr_segs,
+                max_no_speech_prob=float(getattr(cfg.whisper, "no_speech_prob", 0.6) or 0.6),
+            )
+            asr_segs = snap_segments_to_shots(
+                asr_segs,
+                shots,
+                max_shift=float(getattr(cfg.whisper, "edge_snap", 0.35) or 0.35),
+            )
             merged = merge_subtitles(asr_segs, ocr_segments)
             merged_json.write_text(
                 json.dumps({"source": "merged", "segments": merged}, ensure_ascii=False, indent=2),
