@@ -548,6 +548,30 @@ class Store:
         else:
             self.insert("character_assets", character_id=character_id, kind=kind, path=path, complete=flag)
 
+    def delete_character(self, character_id: str) -> None:
+        """Remove one character and their asset rows. Does not touch files."""
+        with self.tx() as con:
+            con.execute("DELETE FROM character_assets WHERE character_id = ?", (character_id,))
+            con.execute("DELETE FROM characters WHERE id = ?", (character_id,))
+
+    def delete_asset_rows(self, asset_ids: Iterable[str]) -> int:
+        ids = [asset_id for asset_id in asset_ids if asset_id]
+        if not ids:
+            return 0
+        with self.tx() as con:
+            con.executemany("DELETE FROM character_assets WHERE id = ?", [(asset_id,) for asset_id in ids])
+        return len(ids)
+
+    def delete_characters(self, character_ids: Iterable[str]) -> int:
+        ids = [character_id for character_id in character_ids if character_id]
+        if not ids:
+            return 0
+        with self.tx() as con:
+            for character_id in ids:
+                con.execute("DELETE FROM character_assets WHERE character_id = ?", (character_id,))
+                con.execute("DELETE FROM characters WHERE id = ?", (character_id,))
+        return len(ids)
+
     # ----- settings / logs -----
 
     def get_setting(self, key: str, default: Any = None) -> Any:

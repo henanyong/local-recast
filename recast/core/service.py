@@ -779,6 +779,217 @@ class RecastService:
         self._on_log("INFO", f"已清理 {len(removed)} 个未使用的 3D头像资产。")
         return {"count": len(removed), "removed": removed}
 
+    def delete_character(self, character_id: str) -> dict[str, Any]:
+        """Remove one person from the library, plus safe generated files.
+
+        The ``characters`` row and every ``character_assets`` row are deleted.
+        A 3D头像资产 is removed only when it passes the same path checks as
+        :meth:`delete_l2`. Generated face samples under ``face_samples`` inside
+        the output tree may be deleted; a reference photo outside that tree is
+        left on disk. Drama, task, and output videos are not touched.
+        """
+        from recast.assets3d.avatar import L2PathError, remove_avatar_dir, require_l2_asset_dir
+        from recast.core.sample_paths import plan_sample_removal, prune_empty_sample_dirs
+
+        ch = self.store.get_character(character_id)
+        if not ch:
+            raise FileNotFoundError("找不到该人物。")
+        assets = list(ch.get("assets") or [])
+        output_root = self.settings.output_root
+
+        planned_l2: list[tuple[dict[str, Any], Path | None]] = []
+        for row in assets:
+            if row.get("kind") not in {"3d", "3d_avatar"}:
+                continue
+            raw = str(row.get("path") or "").strip()
+            if not raw:
+                planned_l2.append((row, None))
+                continue
+            try:
+                dest = require_l2_asset_dir(raw, output_root)
+            except L2PathError as exc:
+                if _l2_target_present(raw):
+                    raise PermissionError(str(exc)) from exc
+                planned_l2.append((row, None))
+                continue
+            planned_l2.append((row, dest))
+
+        sample_targets: list[Path] = []
+        kept_files: list[str] = []
+        prune_from: list[Path] = []
+        shared = self._asset_paths_used_by_others(character_id)
+        seen_samples: set[Path] = set()
+        for row in assets:
+            if row.get("kind") != "face":
+                continue
+            raw = str(row.get("path") or "").strip()
+            if not raw:
+                continue
+            decision = plan_sample_removal(raw, output_root)
+            if decision.action == "delete" and decision.path is not None:
+                if decision.path in shared or decision.path in seen_samples:
+                    kept_files.append(str(decision.path))
+                    continue
+                sample_targets.append(decision.path)
+                seen_samples.add(decision.path)
+            elif decision.action == "missing":
+                prune_from.append(Path(raw).expanduser().parent)
+            elif decision.action == "skip" and _path_present(raw):
+                kept_files.append(str(decision.path or raw))
+
+        removed_samples: list[str] = []
+        for dest in sample_targets:
+            if dest.is_symlink() or not dest.is_file():
+                continue
+            parent = dest.parent
+            dest.unlink()
+            removed_samples.append(str(dest))
+            prune_from.append(parent)
+
+        pruned: list[str] = []
+        seen_dirs: set[Path] = set()
+        for directory in prune_from:
+            for removed in prune_empty_sample_dirs(directory, output_root):
+                if removed in seen_dirs:
+                    continue
+                seen_dirs.add(removed)
+                pruned.append(str(removed))
+
+        protected = self._protected_asset_paths()
+        removed_l2: list[str] = []
+        seen_l2: set[Path] = set()
+        for _row, dest in planned_l2:
+            if dest is None or dest in seen_l2:
+                continue
+            remove_avatar_dir(dest, protected=protected)
+            removed_l2.append(str(dest))
+            seen_l2.add(dest)
+
+        name = ch.get("display_name") or ch.get("name") or character_id
+        self.store.delete_character(character_id)
+        self._on_log("INFO", f"已将「{name}」移出人物库。")
+        return {
+            "character_id": character_id,
+            "display_name": name,
+            "removed_samples": removed_samples,
+            "pruned_dirs": pruned,
+            "kept_files": kept_files,
+            "removed_l2": removed_l2,
+        }
+
+    def list_invalid_samples(self) -> dict[str, Any]:
+        """Describe stale asset rows and people who have no valid face file.
+
+        A row is stale when ``path`` is set and the file is gone. For a 3D头像
+        asset, the row is stale only when the asset directory itself is gone;
+        a directory that is still there is kept. Every character with no
+        remaining valid face file is listed for removal, including confirmed
+        and authorized people. Characters who still have a face file stay;
+        those who also have a stale row are listed under ``keep_characters``.
+        """
+        from recast.assets3d.avatar import asset_directory
+
+        characters = {c["id"]: c for c in self.store.list_characters()}
+        stale: list[dict[str, Any]] = []
+        stale_by_character: dict[str, list[dict[str, Any]]] = {}
+        for row in self.store.list_rows("character_assets"):
+            if not _asset_row_is_stale(row, asset_directory):
+                continue
+            ch = characters.get(row.get("character_id")) or {}
+            item = {
+                "id": row.get("id"),
+                "character_id": row.get("character_id") or "",
+                "kind": row.get("kind") or "",
+                "kind_label": _asset_kind_label(row.get("kind")),
+                "path": row.get("path") or "",
+                "name": ch.get("display_name") or ch.get("name") or row.get("character_id") or "未知人物",
+                "display_name": ch.get("display_name") or ch.get("name") or "",
+                "label": _stale_asset_label(ch, row),
+            }
+            stale.append(item)
+            stale_by_character.setdefault(item["character_id"], []).append(item)
+
+        remove_characters: list[dict[str, Any]] = []
+        keep_characters: list[dict[str, Any]] = []
+        for ch in characters.values():
+            valid_face = _has_valid_face(ch)
+            has_stale = ch["id"] in stale_by_character
+            if not valid_face:
+                remove_characters.append(_character_brief(ch, kept=False))
+            elif has_stale:
+                keep_characters.append(_character_brief(ch, kept=True))
+
+        kind_counts: dict[str, int] = {}
+        for item in stale:
+            kind_counts[item["kind_label"]] = kind_counts.get(item["kind_label"], 0) + 1
+        remove_characters.sort(key=lambda item: (item.get("name") or "", item.get("id") or ""))
+        keep_characters.sort(key=lambda item: (item.get("name") or "", item.get("id") or ""))
+        stale.sort(key=lambda item: (item.get("name") or "", item.get("kind") or "", item.get("path") or ""))
+        return {
+            "stale_assets": stale,
+            "stale_count": len(stale),
+            "kind_counts": kind_counts,
+            "remove_characters": remove_characters,
+            "remove_count": len(remove_characters),
+            "keep_characters": keep_characters,
+            "keep_count": len(keep_characters),
+        }
+
+    def clean_invalid_samples(self) -> dict[str, Any]:
+        """Drop stale asset rows, then drop anyone with no remaining valid face.
+
+        Generated sample directories that are already empty may be removed.
+        Files that still exist, including a valid L2 directory, are not deleted.
+        A person who still has a face file stays, confirmed or not. A person
+        with no remaining face file leaves the library, including when they
+        are confirmed or authorized.
+        """
+        from recast.core.sample_paths import plan_sample_removal, prune_empty_sample_dirs
+
+        plan = self.list_invalid_samples()
+        pruned: list[str] = []
+        seen_dirs: set[Path] = set()
+        output_root = self.settings.output_root
+        for item in plan["stale_assets"]:
+            raw = str(item.get("path") or "").strip()
+            if not raw or item.get("kind") in {"3d", "3d_avatar"}:
+                continue
+            decision = plan_sample_removal(raw, output_root)
+            if decision.action != "missing":
+                continue
+            start = Path(raw).expanduser()
+            start = start if start.is_dir() else start.parent
+            for removed in prune_empty_sample_dirs(start, output_root):
+                if removed in seen_dirs:
+                    continue
+                seen_dirs.add(removed)
+                pruned.append(str(removed))
+
+        self.store.delete_asset_rows([item["id"] for item in plan["stale_assets"] if item.get("id")])
+        self.store.delete_characters([item["id"] for item in plan["remove_characters"] if item.get("id")])
+        self._on_log(
+            "INFO",
+            f"已清理 {plan['stale_count']} 条失效资料，移出 {plan['remove_count']} 个人物。",
+        )
+        return {**plan, "pruned_dirs": pruned}
+
+    def _asset_paths_used_by_others(self, character_id: str) -> set[Path]:
+        used: set[Path] = set()
+        for row in self.store.list_rows("character_assets"):
+            if str(row.get("character_id") or "") == str(character_id):
+                continue
+            raw = row.get("path")
+            if not raw:
+                continue
+            path = Path(str(raw)).expanduser()
+            try:
+                if path.is_symlink() or not path.exists():
+                    continue
+                used.add(path.resolve())
+            except OSError:
+                continue
+        return used
+
     def _protected_asset_paths(self) -> set[Path]:
         """Face, costume, and voice files that cleanup must not unlink."""
         kept: set[Path] = set()
@@ -806,6 +1017,102 @@ class RecastService:
             comfyui_url=self.settings.comfyui_url or None,
         )
 
+
+
+def _flag_on(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() not in {"", "0", "false", "no"}
+    return bool(value)
+
+
+def _path_present(raw: str) -> bool:
+    path = Path(raw).expanduser()
+    try:
+        return path.exists() or path.is_symlink()
+    except OSError:
+        return True
+
+
+def _l2_target_present(raw: str) -> bool:
+    from recast.assets3d.avatar import asset_directory
+
+    path = Path(raw).expanduser()
+    directory = asset_directory(path)
+    try:
+        return path.exists() or path.is_symlink() or directory.exists() or directory.is_symlink()
+    except OSError:
+        return True
+
+
+def _has_valid_face(character: dict[str, Any]) -> bool:
+    for asset in character.get("assets") or []:
+        if asset.get("kind") != "face" or not asset.get("path"):
+            continue
+        try:
+            if Path(str(asset["path"])).is_file():
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _person_label(character: dict[str, Any]) -> str:
+    name = str(character.get("display_name") or character.get("name") or "未命名")
+    cid = str(character.get("id") or "")
+    if cid and cid != name:
+        return f"{name}（{cid}）"
+    return name or cid or "未命名"
+
+
+def _asset_kind_label(kind: str | None) -> str:
+    if kind in {"3d", "3d_avatar"}:
+        return "3D"
+    return {"face": "脸", "costume": "服装", "voice": "声音"}.get(kind or "", kind or "资料")
+
+
+def _stale_asset_label(character: dict[str, Any], row: dict[str, Any]) -> str:
+    base = _person_label(character) if character else str(row.get("character_id") or "未知人物")
+    kind = _asset_kind_label(str(row.get("kind") or ""))
+    filename = Path(str(row.get("path") or "")).name
+    if filename:
+        return f"{base}  {kind}  {filename}"
+    return f"{base}  {kind}"
+
+
+def _character_brief(character: dict[str, Any], *, kept: bool) -> dict[str, Any]:
+    confirmed = _flag_on(character.get("confirmed"))
+    authorized = _flag_on(character.get("authorized"))
+    if authorized and confirmed:
+        status = "已确认 / 已授权"
+    elif authorized:
+        status = "已授权"
+    elif confirmed:
+        status = "已确认"
+    else:
+        status = "未确认"
+    return {
+        "id": character.get("id") or "",
+        "name": character.get("display_name") or character.get("name") or character.get("id") or "未命名",
+        "display_name": character.get("display_name") or character.get("name") or "",
+        "label": _person_label(character),
+        "confirmed": confirmed,
+        "authorized": authorized,
+        "status": status,
+        "kept": kept,
+    }
+
+
+def _asset_row_is_stale(row: dict[str, Any], asset_directory: Any) -> bool:
+    raw = str(row.get("path") or "").strip()
+    if not raw:
+        return False
+    path = Path(raw)
+    try:
+        if row.get("kind") in {"3d", "3d_avatar"}:
+            return not asset_directory(path).exists()
+        return not path.is_file()
+    except OSError:
+        return True
 
 
 def asset_flags(character: dict[str, Any]) -> dict[str, str]:

@@ -55,6 +55,7 @@ QPushButton#primary {
 QPushButton#primary:hover { background-color: #4b7aff; }
 QPushButton#danger { background-color: #5a2a2a; border-color: #7a3a3a; }
 QPushButton#danger:hover { background-color: #6e3333; }
+QPushButton#danger:disabled { color: #6c7080; background-color: #1c1f28; border-color: #2a2e3a; }
 QPushButton#stage {
     min-width: 150px;
     text-align: center;
