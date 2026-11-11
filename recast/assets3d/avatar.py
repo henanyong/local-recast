@@ -11,6 +11,7 @@ production-ready full mesh, unless the user drops in an official FLAME model.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -180,8 +181,179 @@ def load_avatar(path: str | Path) -> dict[str, Any] | None:
         return None
 
 
+class L2PathError(ValueError):
+    """Path is not a character folder inside the configured L2 output tree."""
+
+
+def _character_dirname(character_id: str) -> str:
+    name = str(character_id or "").strip()
+    if not name or name in {".", ".."} or "/" in name or "\\" in name or "\x00" in name:
+        raise L2PathError("人物 ID 不能包含路径分隔符。")
+    return name
+
+
 def bind_path_for(character_id: str, models_or_output: str | Path) -> Path:
-    return Path(models_or_output) / "l2" / character_id
+    """Canonical asset directory: ``<output_root>/l2/<character_id>``.
+
+    ``models_or_output`` is the output root. Callers must not append ``l2``
+    themselves; that extra segment is the legacy ``l2/l2/<id>`` location.
+    """
+    return Path(models_or_output) / "l2" / _character_dirname(character_id)
+
+
+def legacy_bind_path_for(character_id: str, models_or_output: str | Path) -> Path:
+    """Earlier location produced by appending ``l2`` twice: ``<root>/l2/l2/<id>``."""
+    return Path(models_or_output) / "l2" / "l2" / _character_dirname(character_id)
+
+
+def locate_avatar_dir(character_id: str, models_or_output: str | Path) -> Path | None:
+    """Find an existing 3D头像资产 directory.
+
+    The canonical path is checked first, then the legacy doubled path, so
+    assets generated before the write-path fix still resolve.
+    """
+    for candidate in (
+        bind_path_for(character_id, models_or_output),
+        legacy_bind_path_for(character_id, models_or_output),
+    ):
+        if (candidate / "asset.json").is_file():
+            return candidate
+    return None
+
+
+def l2_tree_root(output_root: str | Path) -> Path:
+    return Path(output_root).expanduser().resolve() / "l2"
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+    except ValueError:
+        return False
+    return True
+
+
+def asset_directory(stored_path: str | Path) -> Path:
+    """Folder that holds one 3D头像资产, given a stored file or directory path."""
+    path = Path(stored_path).expanduser()
+    if path.suffix.lower() == ".json":
+        return path.parent
+    try:
+        if path.exists() and path.is_file():
+            return path.parent
+    except OSError:
+        return path
+    return path
+
+
+def require_l2_asset_dir(path: str | Path, output_root: str | Path) -> Path:
+    """Resolve ``path`` to one character folder inside ``output_root/l2``.
+
+    Allowed:
+    - ``<output_root>/l2/<character_id>``
+    - ``<output_root>/l2/l2/<character_id>`` (legacy doubled write)
+
+    The L2 root, the legacy container itself, symlinks, and anything outside
+    that tree (models, virtualenvs, other outputs) are refused.
+    """
+    root = l2_tree_root(output_root)
+    directory = asset_directory(path)
+    try:
+        if directory.is_symlink():
+            raise L2PathError(f"拒绝删除符号链接：{directory}")
+        target = directory.resolve()
+    except L2PathError:
+        raise
+    except OSError as exc:
+        raise L2PathError(f"无法解析路径：{directory}") from exc
+    if target == root or not _is_relative_to(target, root):
+        raise L2PathError(f"拒绝删除 L2 输出目录以外的路径：{target}")
+    parts = target.relative_to(root).parts
+    if len(parts) == 1 and parts[0] not in {".", "..", "l2"}:
+        return target
+    if len(parts) == 2 and parts[0] == "l2" and parts[1] not in {".", "..", "l2"}:
+        return target
+    raise L2PathError(f"拒绝删除该路径：{target}")
+
+
+def iter_l2_asset_dirs(output_root: str | Path) -> list[tuple[Path, bool]]:
+    """List character folders under the L2 tree as ``(directory, is_legacy)``.
+
+    The ``l2/l2`` directory is a container for the old write path, not an
+    asset. Symlinks are skipped so a link cannot be walked out of the tree.
+    """
+    parent = Path(output_root).expanduser().resolve()
+    root = parent / "l2"
+    found: list[tuple[Path, bool]] = []
+    if root.is_symlink() or not root.is_dir():
+        return found
+    for child in sorted(root.iterdir(), key=lambda item: item.name):
+        if child.name == "l2" or child.is_symlink() or not child.is_dir():
+            continue
+        found.append((child, False))
+    doubled = root / "l2"
+    if doubled.is_symlink() or not doubled.is_dir():
+        return found
+    for child in sorted(doubled.iterdir(), key=lambda item: item.name):
+        if child.is_symlink() or not child.is_dir():
+            continue
+        found.append((child, True))
+    return found
+
+
+def remove_avatar_dir(directory: str | Path, *, protected: set[Path] | None = None) -> None:
+    """Delete one asset folder. Face, costume, and voice files are kept.
+
+    Symlinks are unlinked and never followed. A protected path inside the
+    folder is left in place, along with the directories needed to hold it.
+    """
+    directory = Path(directory)
+    protected_resolved: set[Path] = set()
+    for raw in protected or ():
+        candidate = Path(raw)
+        try:
+            if candidate.exists():
+                protected_resolved.add(candidate.resolve())
+        except OSError:
+            continue
+    if directory.is_symlink():
+        raise L2PathError(f"拒绝删除符号链接：{directory}")
+    if not directory.exists():
+        return
+
+    def _kept(path: Path) -> bool:
+        try:
+            return path.resolve() in protected_resolved
+        except OSError:
+            return True
+
+    if directory.is_file():
+        if not _kept(directory):
+            directory.unlink()
+        return
+
+    for dirpath, dirnames, filenames in os.walk(directory, topdown=False, followlinks=False):
+        base = Path(dirpath)
+        for name in filenames:
+            file_path = base / name
+            if _kept(file_path):
+                continue
+            if file_path.is_symlink() or file_path.is_file():
+                file_path.unlink(missing_ok=True)
+        for name in dirnames:
+            child = base / name
+            if child.is_symlink():
+                if not _kept(child):
+                    child.unlink(missing_ok=True)
+                continue
+            try:
+                child.rmdir()
+            except OSError:
+                pass
+    try:
+        directory.rmdir()
+    except OSError:
+        pass
 
 
 def _liveportrait_installed() -> bool:

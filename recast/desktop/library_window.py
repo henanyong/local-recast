@@ -63,6 +63,11 @@ class LibraryWindow(QDialog):
         add_char.clicked.connect(self._add_manual)
         self.l2_btn = QPushButton("生成 3D头像资产")
         self.l2_btn.clicked.connect(self._build_l2)
+        self.l2_del_btn = QPushButton("删除 3D头像资产")
+        self.l2_del_btn.setObjectName("danger")
+        self.l2_del_btn.clicked.connect(self._delete_l2)
+        clean_l2 = QPushButton("清理未使用的 3D头像资产")
+        clean_l2.clicked.connect(self._clean_unused_l2)
 
         left = QVBoxLayout()
         left.addWidget(QLabel("人物列表（聚类候选需确认姓名）"))
@@ -84,6 +89,11 @@ class LibraryWindow(QDialog):
         row.addWidget(save)
         row.addStretch(1)
         right.addLayout(row)
+        l2_row = QHBoxLayout()
+        l2_row.addWidget(self.l2_del_btn)
+        l2_row.addWidget(clean_l2)
+        l2_row.addStretch(1)
+        right.addLayout(l2_row)
         hint = QLabel(
             "L1「人物替换」是本地换脸，不是提取了3D模型。"
             "L2「3D头像资产」是关键点 + 漫反射贴图 + 驱动配置，不是生产级完整网格；未放入官方 FLAME 时也不会假装是。"
@@ -231,3 +241,87 @@ class LibraryWindow(QDialog):
             f"{asset.get('honesty')}\n\n质量分：{asset.get('quality_score')}（{asset.get('quality_flag')}）\n目录：{asset.get('dir')}",
         )
         self.reload()
+
+    def _delete_l2(self) -> None:
+        if not self._current_id:
+            QMessageBox.information(self, "删除 3D头像资产", "请先选择一个人物。")
+            return
+        ch = next((c for c in self.service.characters() if c["id"] == self._current_id), None)
+        name = (ch or {}).get("display_name") or (ch or {}).get("name") or self._current_id
+        if not _confirm(
+            self,
+            "删除 3D头像资产",
+            f"确定删除「{name}」的 3D头像资产？\n\n"
+            "只会删除该人物的 3D头像文件，人脸照片会保留。"
+            "删除后 3D 状态变为「缺失」，之后可以重新生成。",
+            accept="删除",
+        ):
+            return
+        try:
+            self.service.delete_l2(self._current_id)
+        except Exception as exc:
+            QMessageBox.warning(self, "无法删除 3D头像资产", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "已删除 3D头像资产",
+            f"已删除「{name}」的 3D头像资产。人脸照片仍保留，3D 状态为「缺失」。",
+        )
+        self.reload()
+
+    def _clean_unused_l2(self) -> None:
+        try:
+            items = self.service.list_unused_l2()
+        except Exception as exc:
+            QMessageBox.warning(self, "无法检查 3D头像资产", str(exc))
+            return
+        if not items:
+            QMessageBox.information(self, "清理未使用的 3D头像资产", "没有未使用的 3D头像资产。")
+            return
+        shown = items[:30]
+        lines = []
+        for item in shown:
+            label = item.get("display_name") or item.get("name") or item.get("character_id") or "未命名"
+            cid = item.get("character_id") or ""
+            if cid and cid != label:
+                label = f"{label}（{cid}）"
+            reason = item.get("reason") or ""
+            lines.append(f"· {label}：{reason}" if reason else f"· {label}")
+        extra = ""
+        if len(items) > len(shown):
+            extra = f"\n… 另有 {len(items) - len(shown)} 项"
+        detail = (
+            f"将删除 {len(items)} 个未使用的 3D头像资产：\n\n"
+            + "\n".join(lines)
+            + extra
+            + "\n\n不会删除仍在使用的 3D头像，也不会删除人脸、服装、声音，或 L2 目录以外的文件。\n确定删除吗？"
+        )
+        if not _confirm(self, "清理未使用的 3D头像资产", detail, accept="删除"):
+            return
+        try:
+            result = self.service.delete_unused_l2(only=[item.get("path") or "" for item in items])
+        except Exception as exc:
+            QMessageBox.warning(self, "无法清理 3D头像资产", str(exc))
+            return
+        QMessageBox.information(
+            self,
+            "已清理 3D头像资产",
+            f"已删除 {result.get('count', 0)} 个未使用的 3D头像资产。",
+        )
+        self.reload()
+
+
+def _confirm(parent: QWidget, title: str, text: str, *, accept: str, reject: str = "取消") -> bool:
+    box = QMessageBox(parent)
+    box.setIcon(QMessageBox.Icon.Question)
+    box.setWindowTitle(title)
+    box.setText(text)
+    box.setStandardButtons(QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+    box.setDefaultButton(QMessageBox.StandardButton.No)
+    yes = box.button(QMessageBox.StandardButton.Yes)
+    no = box.button(QMessageBox.StandardButton.No)
+    if yes is not None:
+        yes.setText(accept)
+    if no is not None:
+        no.setText(reject)
+    return box.exec() == QMessageBox.StandardButton.Yes
