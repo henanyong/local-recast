@@ -43,6 +43,9 @@ recast/models/**/*.weights
 recast/models/*.pkl
 recast/models/**/*.pkl
 *.pkl
+# Negation of recast/models/** must not track bytecode.
+__pycache__/
+*.py[cod]
 
 # OS
 Thumbs.db

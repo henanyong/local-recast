@@ -218,6 +218,10 @@ def run(
                 break
         for tid in member_ids:
             track_names[tid] = name
+        vecs = [means[tid] for tid in member_ids if tid in means]
+        embedding = None
+        if vecs:
+            embedding = [float(x) for x in _l2_normalize(np.mean(np.stack(vecs, axis=0), axis=0))]
         persons.append(
             {
                 "name": name,
@@ -226,6 +230,7 @@ def run(
                 "track_ids": member_ids,
                 "face_samples": sum(len(samples_meta.get(tid, [])) for tid in member_ids),
                 "first_frame": cluster_first[cid],
+                "embedding": embedding,
             }
         )
 

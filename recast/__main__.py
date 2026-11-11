@@ -23,7 +23,12 @@ def _build_parser() -> argparse.ArgumentParser:
     p.add_argument("--face", default=None, help="参考脸 / 角色图（可选；不提供则跳过替换）")
     p.add_argument("--out", default=None, help="成片路径，默认写到 outputs/<run>/output.mp4")
     p.add_argument("--config", default=str(DEFAULT_CONFIG), help="配置文件，默认 configs/4060ti-8g.yaml")
-    p.add_argument("--track-id", type=int, default=None, help="要替换的轨迹 ID；默认选出现最多的人")
+    p.add_argument(
+        "--track-id",
+        type=int,
+        default=None,
+        help="只替换这一条轨迹（覆盖该轨迹所属人物的整组聚类）。不填则替换每个已匹配人物聚类里的全部轨迹",
+    )
     p.add_argument("--names", default=None, help="人名花名册 YAML，或 '1=张三,2=李四'")
     p.add_argument("--skip-replace", action="store_true", help="只提取字幕/轨迹/姿态，不换脸")
     p.add_argument("--lang", default="auto", help="字幕语言，默认 auto（对中文友好）；可设 zh / en")

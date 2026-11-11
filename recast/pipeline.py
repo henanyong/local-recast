@@ -186,7 +186,9 @@ _SKIPPABLE_STAGES = {
     "extract",
     "library",
     "pose",
-    "replace",
+    # replace stays in the plan when replaced.mp4 already exists so the
+    # checkpoint fingerprint (every reference face, identity, tracks) can
+    # decide. maybe_skip still avoids a second encode when those inputs match.
     "compose",
     "preprocess",
     "subtitles",

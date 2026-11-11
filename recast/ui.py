@@ -127,7 +127,7 @@ v1 **不会**运行 Wan2.2 / AniCrafter（8GB 显存放不下完整视频扩散�
                 video_in = gr.Video(label="输入视频", sources=["upload"])
                 face_in = gr.Image(label="参考脸 / 角色图（可选，不提供则只提取不替换）", type="filepath")
                 config = gr.Dropdown(choices=choices, value=initial, label="配置", allow_custom_value=True)
-                track_id = gr.Number(label="目标轨迹 ID（留空则自动选出现最多的人）", precision=0, value=None)
+                track_id = gr.Number(label="目标轨迹 ID（留空则替换已匹配人物的全部轨迹；填写则只替换该轨迹）", precision=0, value=None)
                 names = gr.Textbox(
                     label="人名映射",
                     placeholder="1=张三,2=李四  或填写 examples/names.yaml 路径",

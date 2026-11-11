@@ -136,6 +136,135 @@ def _load_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+def _reference_from_character(ch: dict[str, Any]) -> dict[str, Any] | None:
+    for asset in ch.get("assets") or []:
+        path = asset.get("path")
+        if asset.get("kind") == "face" and path and Path(str(path)).is_file():
+            return {
+                "character_id": ch.get("id"),
+                "name": ch.get("display_name") or ch.get("name") or Path(str(path)).stem,
+                "face_path": str(path),
+            }
+    return None
+
+
+def _same_face(rows: list[dict[str, Any]], face_path: str) -> bool:
+    try:
+        target = Path(face_path).resolve()
+    except OSError:
+        target = Path(face_path)
+    for row in rows:
+        try:
+            if Path(str(row.get("face_path"))).resolve() == target:
+                return True
+        except OSError:
+            if str(row.get("face_path")) == face_path:
+                return True
+    return False
+
+
+def _character_reference(store: Store, character_id: str, *, require_auth: bool) -> dict[str, Any]:
+    ch = store.get_character(character_id)
+    if not ch:
+        raise RuntimeError(f"找不到人物: {character_id}")
+    authorized = bool(ch.get("authorized") and ch.get("auth_type"))
+    if require_auth and not authorized:
+        raise PermissionError(
+            "人物替换仅能用于已勾选授权的角色（自有拍摄 / 已授权 / 自有生成角色）。"
+        )
+    row = _reference_from_character(ch)
+    if row is None:
+        label = ch.get("display_name") or ch.get("name") or character_id
+        raise RuntimeError(
+            ST_NEED_ASSETS
+            + f"：人物「{label}」缺少参考脸，请在人物库中确认姓名、勾选授权并指定参考脸后再执行人物替换。"
+        )
+    return row
+
+
+def _reference_from_face_file(store: Store | None, face: Path, *, require_auth: bool) -> dict[str, Any]:
+    if require_auth and store is not None:
+        matched: dict[str, Any] | None = None
+        for ch in store.list_characters():
+            for asset in ch.get("assets") or []:
+                path = asset.get("path")
+                if not (asset.get("kind") == "face" and path):
+                    continue
+                try:
+                    same = Path(str(path)).resolve() == face.resolve()
+                except OSError:
+                    same = str(path) == str(face)
+                if same:
+                    matched = ch
+                    break
+            if matched is not None:
+                break
+        if matched is None:
+            raise PermissionError(
+                "请先在人物库中为该参考脸确认姓名并勾选授权，再执行人物替换。"
+            )
+        if not (matched.get("authorized") and matched.get("auth_type")):
+            raise PermissionError(
+                "人物替换仅能用于已勾选授权的角色（自有拍摄 / 已授权 / 自有生成角色）。"
+            )
+        row = _reference_from_character(matched)
+        if row is not None:
+            return row
+    return {
+        "character_id": None,
+        "name": face.stem,
+        "face_path": str(face),
+    }
+
+
+def resolve_swap_references(
+    *,
+    store: Store | None,
+    character_id: str | None = None,
+    character_ids: list[str] | None = None,
+    face: str | Path | None = None,
+    require_auth: bool = False,
+) -> list[dict[str, Any]]:
+    """Authorized reference faces for one replace pass.
+
+    An explicit character id is checked and included. When none is given and a
+    store is available, every authorized character that has a reference face is
+    included. A raw face file is only added when authorization allows it.
+    """
+    explicit: list[str] = []
+    seen: set[str] = set()
+    for cid in list(character_ids or []):
+        if cid and str(cid) not in seen:
+            explicit.append(str(cid))
+            seen.add(str(cid))
+    if character_id and str(character_id) not in seen:
+        explicit.append(str(character_id))
+        seen.add(str(character_id))
+
+    rows: list[dict[str, Any]] = []
+    if store is not None and explicit:
+        for cid in explicit:
+            try:
+                rows.append(_character_reference(store, cid, require_auth=require_auth))
+            except RuntimeError:
+                # A single requested id with no file can still fall through to --face.
+                if not (len(explicit) == 1 and face and Path(face).is_file()):
+                    raise
+    elif store is not None and not face:
+        for ch in store.list_characters():
+            if not (ch.get("authorized") and ch.get("auth_type")):
+                continue
+            row = _reference_from_character(ch)
+            if row is not None:
+                rows.append(row)
+
+    if face and Path(face).is_file():
+        raw = _reference_from_face_file(store, Path(face), require_auth=require_auth)
+        if not _same_face(rows, raw["face_path"]):
+            rows.append(raw)
+    return rows
+
+
 def authorized_faces(store: Store | None, character_id: str | None = None) -> list[dict[str, Any]]:
     if store is None:
         return []
@@ -159,40 +288,15 @@ def resolve_swap_face(
     face: str | Path | None,
     require_auth: bool,
 ) -> Path | None:
-    if character_id and store is not None:
-        rows = authorized_faces(store, character_id)
-        if rows:
-            return Path(rows[0]["face_path"])
-        ch = store.get_character(character_id)
-        if ch and require_auth and not (ch.get("authorized") and ch.get("auth_type")):
-            raise PermissionError(
-                "人物替换仅能用于已勾选授权的角色（自有拍摄 / 已授权 / 自有生成角色）。"
-            )
-        if ch:
-            for a in ch.get("assets") or []:
-                if a.get("kind") == "face" and a.get("path") and Path(str(a["path"])).is_file():
-                    if require_auth:
-                        raise PermissionError(
-                            "人物替换仅能用于已勾选授权的角色（自有拍摄 / 已授权 / 自有生成角色）。"
-                        )
-                    return Path(str(a["path"]))
-    if face and Path(face).is_file():
-        if require_auth and store is not None:
-            # Desktop path: a raw face file is only OK if it belongs to an authorized character
-            for ch in store.list_characters():
-                for a in ch.get("assets") or []:
-                    if a.get("kind") == "face" and a.get("path") and Path(str(a["path"])).resolve() == Path(face).resolve():
-                        if ch.get("authorized") and ch.get("auth_type"):
-                            return Path(face)
-                        raise PermissionError(
-                            "人物替换仅能用于已勾选授权的角色（自有拍摄 / 已授权 / 自有生成角色）。"
-                        )
-            # unregistered file on the desktop: still require the caller to have authorized somehow
-            raise PermissionError(
-                "请先在人物库中为该参考脸确认姓名并勾选授权，再执行人物替换。"
-            )
-        return Path(face)
-    return None
+    rows = resolve_swap_references(
+        store=store,
+        character_id=character_id,
+        face=face,
+        require_auth=require_auth,
+    )
+    if not rows:
+        return None
+    return Path(rows[0]["face_path"])
 
 
 def run_episode(
@@ -203,6 +307,7 @@ def run_episode(
     stages: Sequence[str] | None = None,
     face: str | Path | None = None,
     character_id: str | None = None,
+    character_ids: list[str] | None = None,
     track_id: int | None = None,
     names: str | Path | dict[str, str] | None = None,
     lang: str | None = "auto",
@@ -447,20 +552,19 @@ def run_episode(
             release_cuda()
         mark("pose", "关键点完成", 1.0)
 
-    # ----- 04 人物替换 (L1, never called 3D) -----
-    do_replace = (not skip_replace) and (face is not None or character_id is not None)
+    # ----- 04 人物替换 (L1 local face swap, never described as extracting a 3D model) -----
+    swap_refs: list[dict[str, Any]] = []
     replaced_path: Path | None = None
-    if do_replace and (run_dir / "replaced.mp4").is_file() and "replace" in wanted:
-        replaced_path = run_dir / "replaced.mp4"
     if "replace" in wanted and not skip_replace:
         mark("replace", "准备人物替换（L1 本地换脸，不是提取了3D模型）", 0.05)
-        face_path = resolve_swap_face(
+        swap_refs = resolve_swap_references(
             store=store,
             character_id=character_id,
+            character_ids=character_ids,
             face=face,
             require_auth=require_auth,
         )
-        if face_path is None:
+        if not swap_refs:
             raise RuntimeError(
                 ST_NEED_ASSETS + "：缺少已授权角色的参考脸，请在人物库中确认姓名、勾选授权并指定参考脸后再执行人物替换。"
             )
@@ -469,27 +573,40 @@ def run_episode(
         track_payload = load_track_payload(run_dir)
         if info is None or track_payload is None:
             raise RuntimeError("人物替换需要先完成「03 人物提取与建库」。")
-        if not maybe_skip("replace", [video_alias, face_path, run_dir / "identity.json"], [run_dir / "replaced.mp4"]):
+        from recast.stages.replace import replace_checkpoint_inputs
+
+        face_paths = [Path(str(row["face_path"])) for row in swap_refs]
+        replace_inputs = replace_checkpoint_inputs(video_alias, run_dir, face_paths)
+        if (run_dir / "replaced.mp4").is_file():
+            replaced_path = run_dir / "replaced.mp4"
+        if not maybe_skip("replace", replace_inputs, [run_dir / "replaced.mp4"]):
             check_cancel()
             from recast.stages import replace
 
-            log.info("执行 L1 人物替换（本地换脸），参考图 %s。这不是 3D 头像，也不是提取了3D模型。", face_path.name)
+            names = "、".join(str(row.get("name") or Path(str(row["face_path"])).name) for row in swap_refs)
+            log.info(
+                "执行 L1 人物替换（本地换脸），参考脸 %s。这不是 3D 头像，也不是提取了3D模型。",
+                names,
+            )
             replaced_path = replace.run(
                 video_alias,
                 info,
                 track_payload,
                 run_dir,
                 cfg,
-                face_image=face_path,
+                references=swap_refs,
                 track_id=track_id,
             )
-            remember("replace", [video_alias, face_path, run_dir / "identity.json"], [Path(replaced_path)])
+            remember("replace", replace_inputs, [Path(replaced_path)])
             release_cuda()
+        plan_doc = _load_json(run_dir / "replace_plan.json") or {}
+        summary["replace_plan"] = plan_doc
         summary["replaced"] = str(replaced_path or (run_dir / "replaced.mp4"))
         vram_report("人物替换后")
         mark("replace", "人物替换完成", 1.0)
     elif "replace" in wanted and skip_replace:
         log.info("已跳过人物替换。")
+    do_replace = bool(swap_refs) and not skip_replace
 
     # ----- 05 compose -----
     if "compose" in wanted:
@@ -643,6 +760,7 @@ def dispatch_job(
     wav_table: str | Path | None = None,
     face=None,
     character_id=None,
+    character_ids: list[str] | None = None,
     track_id=None,
     names=None,
     lang: str | None = "auto",
@@ -701,6 +819,7 @@ def dispatch_job(
                     stages=["replace", "compose"],
                     face=face,
                     character_id=character_id,
+                    character_ids=character_ids,
                     track_id=track_id,
                     names=names,
                     lang=lang,
@@ -758,6 +877,7 @@ def dispatch_job(
             stages=import_stages,
             face=face,
             character_id=character_id,
+            character_ids=character_ids,
             track_id=track_id,
             names=names,
             lang=lang,
