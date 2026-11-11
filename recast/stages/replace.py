@@ -7,6 +7,7 @@ because they will not reliably fit in 8GB VRAM.
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 from typing import Any, Protocol
@@ -22,6 +23,12 @@ from recast.media import imread, open_capture
 from recast.runtime import check_cancel
 
 log = logging.getLogger("recast")
+
+# Identity clustering uses cosine distance (default 0.45), i.e. similarity about 0.55,
+# to treat tracks as the same person. A reference still has to clear that bar, and
+# beat the next cluster, before we swap. Below that we skip instead of guessing.
+DEFAULT_MATCH_SIMILARITY = 0.55
+MATCH_MARGIN = 0.08
 
 
 class ReplacementBackend(Protocol):
@@ -152,34 +159,63 @@ class InswapperBackend:
             self._swapper.prepare(ctx_id=ctx_id)
         vram_report("替换-已加载")
 
-    def prepare_source(self, face_image_path: str | Path) -> None:
+    def _best_face(self, face_image_path: str | Path) -> Any | None:
         if self._app is None:
-            raise RuntimeError("InswapperBackend.load() 必须先于 prepare_source() 调用")
+            raise RuntimeError("InswapperBackend.load() 必须先于检测调用")
         img = imread(face_image_path)
         if img is None:
             raise FileNotFoundError(f"无法读取参考脸图片: {face_image_path}")
         faces = self._app.get(img) or []
         if not faces:
-            raise RuntimeError(f"参考图里没有检测到人脸: {face_image_path}")
+            return None
         faces = sorted(faces, key=lambda f: float(getattr(f, "det_score", 0.0)), reverse=True)
-        self._source_face = faces[0]
+        return faces[0]
+
+    def prepare_source(self, face_image_path: str | Path) -> Any:
+        face = self._best_face(face_image_path)
+        if face is None:
+            raise RuntimeError(f"参考图里没有检测到人脸: {face_image_path}")
+        self._source_face = face
         log.info(
             "参考脸已就绪（检测分 %.3f，框 %s）",
             float(getattr(self._source_face, "det_score", 0.0) or 0.0),
             [round(float(x), 1) for x in self._source_face.bbox],
         )
+        return face
 
-    def replace_frame(self, frame: np.ndarray, target_bboxes: list[list[float]]) -> np.ndarray:
-        if self._app is None or self._swapper is None or self._source_face is None:
+    def embed_image(self, face_image_path: str | Path) -> list[float] | None:
+        """Embedding of the clearest face in an image, or None when none is detected."""
+        try:
+            face = self._best_face(face_image_path)
+        except Exception as exc:
+            log.debug("读取人脸特征失败 %s: %s", face_image_path, exc)
+            return None
+        if face is None:
+            return None
+        return embedding_of(face)
+
+    def replace_frame(
+        self,
+        frame: np.ndarray,
+        target_bboxes: list[list[float]],
+        source_faces: list[Any] | None = None,
+    ) -> np.ndarray:
+        if self._app is None or self._swapper is None:
             return frame
         if not target_bboxes:
             return frame
+        if source_faces is None:
+            if self._source_face is None:
+                return frame
+            source_faces = [self._source_face] * len(target_bboxes)
         faces = self._app.get(frame) or []
         if not faces:
             return frame
         out = frame
         used: set[int] = set()
-        for bbox in target_bboxes:
+        for bbox, source in zip(target_bboxes, source_faces):
+            if source is None:
+                continue
             best_i, best = -1, 0.0
             for i, face in enumerate(faces):
                 if i in used:
@@ -194,7 +230,7 @@ class InswapperBackend:
                 continue
             used.add(best_i)
             try:
-                out = self._swapper.get(out, faces[best_i], self._source_face, paste_back=True)
+                out = self._swapper.get(out, faces[best_i], source, paste_back=True)
             except Exception as exc:
                 log.debug("单帧替换失败: %s", exc)
         return out
@@ -217,32 +253,487 @@ def build_backend(cfg: RecastConfig) -> ReplacementBackend:
     return InswapperBackend()
 
 
+def embedding_of(face: Any) -> list[float] | None:
+    emb = getattr(face, "normed_embedding", None)
+    if emb is None:
+        emb = getattr(face, "embedding", None)
+    if emb is None:
+        return None
+    vec = np.asarray(emb, dtype=np.float32).reshape(-1)
+    norm = float(np.linalg.norm(vec))
+    if norm < 1e-8:
+        return None
+    return [float(x) for x in (vec / norm)]
+
+
+def as_embedding(value: Any) -> list[float] | None:
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    try:
+        vec = [float(x) for x in value]
+    except (TypeError, ValueError):
+        return None
+    return vec or None
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = sum(x * x for x in a) ** 0.5
+    nb = sum(y * y for y in b) ** 0.5
+    if na <= 0 or nb <= 0:
+        return 0.0
+    return dot / (na * nb)
+
+
+def match_similarity(identity: dict[str, Any] | None, override: float | None = None) -> float:
+    """Minimum cosine similarity for a confident reference-to-cluster match."""
+    if override is not None:
+        return float(override)
+    raw = (identity or {}).get("cluster_threshold")
+    if raw is None:
+        return DEFAULT_MATCH_SIMILARITY
+    try:
+        dist = float(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MATCH_SIMILARITY
+    if 0.0 < dist < 1.0:
+        return 1.0 - dist
+    return DEFAULT_MATCH_SIMILARITY
+
+
+def _known_track_ids(track_payload: dict[str, Any] | None, identity: dict[str, Any] | None) -> list[int]:
+    seen: set[int] = set()
+    ordered: list[int] = []
+
+    def _add(raw: Any) -> None:
+        if raw is None:
+            return
+        tid = int(raw)
+        if tid not in seen:
+            seen.add(tid)
+            ordered.append(tid)
+
+    for track in (track_payload or {}).get("tracks") or []:
+        _add(track.get("track_id"))
+    for person in (identity or {}).get("persons") or []:
+        for tid in person.get("track_ids") or []:
+            _add(tid)
+    return ordered
+
+
+def _tracks_in_cluster(
+    identity: dict[str, Any] | None,
+    track_payload: dict[str, Any] | None,
+    cluster_id: int,
+) -> list[int]:
+    if identity:
+        for person in identity.get("persons") or []:
+            if person.get("cluster_id") is None:
+                continue
+            if int(person["cluster_id"]) != int(cluster_id):
+                continue
+            ids: list[int] = []
+            seen: set[int] = set()
+            for tid in person.get("track_ids") or []:
+                tid = int(tid)
+                if tid not in seen:
+                    seen.add(tid)
+                    ids.append(tid)
+            if ids:
+                return ids
+    ids = []
+    seen = set()
+    for track in (track_payload or {}).get("tracks") or []:
+        if track.get("cluster_id") is None or track.get("track_id") is None:
+            continue
+        if int(track["cluster_id"]) != int(cluster_id):
+            continue
+        tid = int(track["track_id"])
+        if tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+    return ids
+
+
 def select_target_tracks(
     track_payload: dict[str, Any],
-    track_id: int | None,
+    track_id: int | None = None,
+    *,
+    cluster_id: int | None = None,
+    identity: dict[str, Any] | None = None,
 ) -> list[int]:
-    tracks = list(track_payload.get("tracks") or [])
-    if not tracks:
+    """Tracks to swap for one person.
+
+    A cluster contributes every track id that belongs to it. An explicit
+    ``track_id`` narrows that one person to the given track when the track is
+    part of the cluster. There is no longest-track fallback.
+    """
+    known = _known_track_ids(track_payload, identity)
+    known_set = set(known)
+    if not known_set:
         raise RuntimeError("没有可用于替换的人物轨迹。")
-    if track_id is not None:
-        ids = {int(t["track_id"]) for t in tracks}
-        if int(track_id) not in ids:
-            raise RuntimeError(f"找不到 track-id={track_id}。可用: {sorted(ids)}")
+
+    if cluster_id is None:
+        if track_id is None:
+            raise RuntimeError(
+                "未指定人物聚类。人物替换按 identity.json 的聚类选择全部轨迹，不再默认只换出现最多的一条。"
+            )
+        if int(track_id) not in known_set:
+            raise RuntimeError(f"找不到 track-id={track_id}。可用: {sorted(known_set)}")
         return [int(track_id)]
 
-    def _length(t: dict[str, Any]) -> int:
-        return len(t.get("frames") or [])
+    ids = _tracks_in_cluster(identity, track_payload, int(cluster_id))
+    if known_set:
+        present = [i for i in ids if i in known_set]
+        if present:
+            ids = present
+    if not ids:
+        raise RuntimeError(f"聚类 {cluster_id} 没有可替换的轨迹。")
+    if track_id is not None and int(track_id) in set(ids):
+        return [int(track_id)]
+    return ids
 
-    # Prefer the person who appears the most; break ties by earlier first_frame.
-    tracks = sorted(tracks, key=lambda t: (-_length(t), int(t.get("first_frame") or 0), int(t["track_id"])))
-    chosen = int(tracks[0]["track_id"])
-    log.info(
-        "未指定 --track-id，默认替换出现帧数最多的轨迹 %s（%s，%s 帧）",
-        chosen,
-        tracks[0].get("name"),
-        _length(tracks[0]),
-    )
-    return [chosen]
+
+def _person_name(person: dict[str, Any]) -> str:
+    return str(person.get("name") or person.get("auto_name") or person.get("cluster_id") or "未命名")
+
+
+def _owns_track(person: dict[str, Any], track_id: int | None) -> bool:
+    if track_id is None:
+        return False
+    return int(track_id) in {int(t) for t in (person.get("track_ids") or [])}
+
+
+def _owner_name(identity: dict[str, Any] | None, track_id: int | None) -> str | None:
+    if track_id is None or not identity:
+        return None
+    for person in identity.get("persons") or []:
+        if _owns_track(person, track_id):
+            return _person_name(person)
+    return None
+
+
+def _ref_brief(ref: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "character_id": ref.get("character_id"),
+        "name": ref.get("name") or Path(str(ref.get("face_path") or "")).stem,
+        "face_path": str(ref.get("face_path") or ""),
+    }
+
+
+def plan_replace_targets(
+    references: list[dict[str, Any]],
+    identity: dict[str, Any] | None,
+    track_payload: dict[str, Any] | None = None,
+    *,
+    track_id: int | None = None,
+    min_similarity: float | None = None,
+    margin: float = MATCH_MARGIN,
+) -> dict[str, Any]:
+    """Map each reference face onto one identity cluster, or skip it.
+
+    Assignment is one-to-one. A reference is skipped when it has no embedding,
+    its best cluster is below ``min_similarity``, or the top two clusters are
+    too close to tell apart. An explicit ``track_id`` only narrows the matched
+    person who owns that track.
+    """
+    identity = identity or {}
+    track_payload = track_payload or {"tracks": []}
+    threshold = match_similarity(identity, min_similarity)
+    if track_id is not None:
+        known = _known_track_ids(track_payload, identity)
+        if int(track_id) not in set(known):
+            raise RuntimeError(f"找不到 track-id={track_id}。可用: {sorted(known)}")
+
+    persons = []
+    for person in identity.get("persons") or []:
+        emb = as_embedding(person.get("embedding"))
+        tracks = [int(t) for t in (person.get("track_ids") or [])]
+        if emb is None or not tracks:
+            continue
+        persons.append({**person, "embedding": emb, "track_ids": tracks})
+
+    any_embedding = any(as_embedding(p.get("embedding")) for p in (identity.get("persons") or []))
+    skipped: list[dict[str, Any]] = []
+    scored: list[list[tuple[float, int]]] = []
+    handled: set[int] = set()
+
+    for ri, ref in enumerate(references):
+        brief = _ref_brief(ref)
+        emb = as_embedding(ref.get("embedding"))
+        if emb is None:
+            reason = ref.get("embed_error") or "参考脸没有人脸特征，无法与视频中的人物对照，已跳过。"
+            skipped.append({**brief, "reason": str(reason), "score": None})
+            handled.add(ri)
+            scored.append([])
+            continue
+        if not persons:
+            if not any_embedding:
+                reason = "身份聚类没有人脸特征，无法确认参考脸对应哪个人，已跳过以免换错人。"
+            else:
+                reason = "身份聚类里没有带轨迹的人物，已跳过以免换错人。"
+            skipped.append({**brief, "reason": reason, "score": None})
+            handled.add(ri)
+            scored.append([])
+            continue
+        pairs = [(cosine_similarity(emb, person["embedding"]), pi) for pi, person in enumerate(persons)]
+        pairs.sort(key=lambda item: (-item[0], item[1]))
+        scored.append(pairs)
+
+    candidates: list[tuple[float, int, int]] = []
+    for ri, pairs in enumerate(scored):
+        for sim, pi in pairs:
+            candidates.append((sim, ri, pi))
+    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
+
+    assigned: dict[int, tuple[int, float]] = {}
+    used_person: set[int] = set()
+    for sim, ri, pi in candidates:
+        if ri in handled or ri in assigned or pi in used_person:
+            continue
+        pairs = scored[ri]
+        if not pairs or pi != pairs[0][1]:
+            continue
+        best_sim = pairs[0][0]
+        if best_sim < threshold:
+            continue
+        second = pairs[1][0] if len(pairs) > 1 else -1.0
+        if second >= 0 and best_sim - second < margin:
+            person_a = persons[pairs[0][1]]
+            person_b = persons[pairs[1][1]]
+            skipped.append(
+                {
+                    **_ref_brief(references[ri]),
+                    "reason": (
+                        f"与「{_person_name(person_a)}」相似度 {best_sim:.3f}，"
+                        f"与「{_person_name(person_b)}」相似度 {second:.3f}，"
+                        f"差距小于 {margin:.2f}，无法确认是谁，已跳过以免换错人。"
+                    ),
+                    "score": best_sim,
+                }
+            )
+            handled.add(ri)
+            continue
+        assigned[ri] = (pi, best_sim)
+        used_person.add(pi)
+
+    targets: list[dict[str, Any]] = []
+    for ri, (pi, sim) in sorted(assigned.items()):
+        person = persons[pi]
+        ref = references[ri]
+        override = int(track_id) if _owns_track(person, track_id) else None
+        cluster_raw = person.get("cluster_id")
+        cluster_id = int(cluster_raw) if cluster_raw is not None else None
+        track_ids = select_target_tracks(
+            track_payload,
+            override,
+            cluster_id=cluster_id,
+            identity=identity,
+        )
+        targets.append(
+            {
+                **_ref_brief(ref),
+                "cluster_id": cluster_id,
+                "person_name": _person_name(person),
+                "track_ids": track_ids,
+                "score": sim,
+            }
+        )
+
+    for ri, ref in enumerate(references):
+        if ri in handled or ri in assigned:
+            continue
+        pairs = scored[ri]
+        brief = _ref_brief(ref)
+        if not pairs:
+            continue
+        best_sim, best_pi = pairs[0]
+        person = persons[best_pi]
+        if best_pi in used_person:
+            reason = (
+                f"最相似的人物「{_person_name(person)}」已由另一张参考脸匹配"
+                f"（相似度 {best_sim:.3f}），已跳过以免把两张脸换到同一个人。"
+            )
+        else:
+            reason = (
+                f"与最相似的人物「{_person_name(person)}」相似度 {best_sim:.3f}，"
+                f"低于 {threshold:.2f}，已跳过以免换错人。"
+            )
+        skipped.append({**brief, "reason": reason, "score": best_sim})
+
+    track_note = None
+    if track_id is not None:
+        owner = _owner_name(identity, track_id)
+        narrowed = [t for t in targets if t.get("track_ids") == [int(track_id)]]
+        if narrowed:
+            who = narrowed[0].get("person_name") or narrowed[0].get("name")
+            track_note = (
+                f"track-id={int(track_id)} 只收窄「{who}」的轨迹，"
+                "其他已匹配人物仍替换聚类内的全部轨迹。"
+            )
+        elif owner:
+            track_note = (
+                f"指定的 track-id={int(track_id)} 属于「{owner}」，"
+                "但没有参考脸被确认匹配到该人物，因此没有替换这条轨迹。"
+            )
+        else:
+            track_note = f"已指定 track-id={int(track_id)}。"
+
+    return {
+        "targets": targets,
+        "skipped": skipped,
+        "track_note": track_note,
+        "min_similarity": threshold,
+    }
+
+
+def index_swap_frames(
+    track_payload: dict[str, Any],
+    targets: list[dict[str, Any]],
+) -> dict[int, list[dict[str, Any]]]:
+    """One frame index → every box that should be swapped, across people."""
+    source_of: dict[int, str] = {}
+    for target in targets:
+        key = str(target.get("source_key") or target.get("face_path") or "")
+        for tid in target.get("track_ids") or []:
+            source_of[int(tid)] = key
+    frames: dict[int, list[dict[str, Any]]] = {}
+    for track in track_payload.get("tracks") or []:
+        if track.get("track_id") is None:
+            continue
+        tid = int(track["track_id"])
+        if tid not in source_of:
+            continue
+        for item in track.get("frames") or []:
+            frames.setdefault(int(item["frame_idx"]), []).append(
+                {
+                    "bbox": item["bbox"],
+                    "source_key": source_of[tid],
+                    "track_id": tid,
+                }
+            )
+    return frames
+
+
+def replace_checkpoint_inputs(
+    video: str | Path,
+    workdir: str | Path,
+    face_paths: list[str | Path],
+) -> list[Path]:
+    """Fingerprint inputs for the replace step: video, identity, tracks, every face."""
+    work = Path(workdir)
+    inputs = [Path(video), work / "identity.json"]
+    for name in ("tracks_raw.json", "tracks.json"):
+        path = work / name
+        if path.is_file():
+            inputs.append(path)
+    for face in face_paths:
+        inputs.append(Path(face))
+    return inputs
+
+
+def _load_identity(workdir: Path, track_payload: dict[str, Any], identity: dict[str, Any] | None) -> dict[str, Any]:
+    if identity:
+        return identity
+    cached = track_payload.get("_identity")
+    if isinstance(cached, dict) and cached:
+        return cached
+    path = Path(workdir) / "identity.json"
+    if path.is_file():
+        return json.loads(path.read_text(encoding="utf-8"))
+    return {}
+
+
+def _fill_cluster_embeddings(backend: InswapperBackend, identity: dict[str, Any], workdir: Path) -> None:
+    persons = list(identity.get("persons") or [])
+    if not persons or all(as_embedding(p.get("embedding")) for p in persons):
+        return
+    samples: dict[str, list[str]] = {}
+    index = Path(workdir) / "face_samples" / "index.json"
+    if index.is_file():
+        try:
+            raw = json.loads(index.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                samples = {str(k): [str(p) for p in (v or [])] for k, v in raw.items()}
+        except Exception as exc:
+            log.debug("读取人脸样本索引失败: %s", exc)
+    for person in persons:
+        if as_embedding(person.get("embedding")):
+            continue
+        auto = str(person.get("auto_name") or person.get("name") or "")
+        for raw in samples.get(auto) or []:
+            emb = backend.embed_image(raw)
+            if emb:
+                person["embedding"] = emb
+                log.info("聚类「%s」使用人脸样本补齐了特征。", _person_name(person))
+                break
+
+
+def _public_plan(plan: dict[str, Any]) -> dict[str, Any]:
+    def _target(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "character_id": row.get("character_id"),
+            "name": row.get("name"),
+            "face_path": row.get("face_path"),
+            "cluster_id": row.get("cluster_id"),
+            "person_name": row.get("person_name"),
+            "track_ids": list(row.get("track_ids") or []),
+            "score": row.get("score"),
+        }
+
+    def _skip(row: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "character_id": row.get("character_id"),
+            "name": row.get("name"),
+            "face_path": row.get("face_path"),
+            "reason": row.get("reason"),
+            "score": row.get("score"),
+        }
+
+    return {
+        "targets": [_target(row) for row in plan.get("targets") or []],
+        "skipped": [_skip(row) for row in plan.get("skipped") or []],
+        "track_note": plan.get("track_note"),
+        "min_similarity": plan.get("min_similarity"),
+        "note": "L1 人物替换是本地换脸，不是提取了3D模型。",
+    }
+
+
+def _write_plan(workdir: Path, plan: dict[str, Any]) -> Path:
+    path = Path(workdir) / "replace_plan.json"
+    path.write_text(json.dumps(_public_plan(plan), ensure_ascii=False, indent=2), encoding="utf-8")
+    return path
+
+
+def _collect_references(
+    face_image: str | Path | None,
+    references: list[dict[str, Any]] | None,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for ref in references or []:
+        path = ref.get("face_path")
+        if not path:
+            continue
+        key = str(Path(path))
+        if key in seen:
+            continue
+        seen.add(key)
+        rows.append({**ref, "face_path": key})
+    if face_image:
+        path = Path(face_image)
+        key = str(path)
+        if path.is_file() and key not in seen:
+            rows.append(
+                {
+                    "character_id": None,
+                    "name": path.stem,
+                    "face_path": key,
+                }
+            )
+    return rows
 
 
 def run(
@@ -251,54 +742,111 @@ def run(
     track_payload: dict[str, Any],
     workdir: Path,
     cfg: RecastConfig,
-    face_image: str | Path,
+    face_image: str | Path | None = None,
     track_id: int | None = None,
+    *,
+    references: list[dict[str, Any]] | None = None,
+    identity: dict[str, Any] | None = None,
+    min_similarity: float | None = None,
 ) -> Path:
-    targets = set(select_target_tracks(track_payload, track_id))
-    frame_boxes: dict[int, list[list[float]]] = {}
-    for track in track_payload.get("tracks") or []:
-        if int(track["track_id"]) not in targets:
-            continue
-        for item in track.get("frames") or []:
-            frame_boxes.setdefault(int(item["frame_idx"]), []).append(item["bbox"])
+    """Swap every matched reference in one pass. Output is always replaced.mp4."""
+    workdir = Path(workdir)
+    refs = _collect_references(face_image, references)
+    if not refs:
+        raise RuntimeError("缺少参考脸，无法进行人物替换。")
+    ident = _load_identity(workdir, track_payload, identity)
+    if not ident:
+        raise RuntimeError("人物替换需要 identity.json 中的人物聚类，请先完成「03 人物提取与建库」。")
 
     device = requested_device(cfg.device)
     vram_report("替换-加载前")
     backend = build_backend(cfg)
     backend.load(cfg, device)
-    backend.prepare_source(face_image)
-
-    out_path = workdir / "replaced.mp4"
-    cap = open_capture(video)
-    writer = open_ffmpeg_writer(out_path, info.width, info.height, info.fps, crf=cfg.compose.crf)
-    total = info.frame_count or None
-    pbar = tqdm(total=total, desc="替换", unit="f")
-    frame_idx = 0
-    swapped = 0
+    prepared: dict[str, Any] = {}
     try:
-        while True:
-            check_cancel()
-            ok, frame = cap.read()
-            if not ok:
-                break
-            boxes = frame_boxes.get(frame_idx, [])
-            if boxes:
-                new_frame = backend.replace_frame(frame, boxes)
-                if new_frame is not frame:
-                    swapped += 1
-                frame = new_frame
-            if frame.shape[1] != info.width or frame.shape[0] != info.height:
-                frame = cv2.resize(frame, (info.width, info.height))
-            writer.stdin.write(np.ascontiguousarray(frame).tobytes())
-            frame_idx += 1
-            pbar.update(1)
+        _fill_cluster_embeddings(backend, ident, workdir)
+        for ref in refs:
+            try:
+                prepared[str(ref["face_path"])] = backend.prepare_source(ref["face_path"])
+            except Exception as exc:
+                ref["embed_error"] = str(exc)
+                continue
+            if as_embedding(ref.get("embedding")) is None:
+                ref["embedding"] = embedding_of(prepared[str(ref["face_path"])])
+        plan = plan_replace_targets(
+            refs,
+            ident,
+            track_payload,
+            track_id=track_id,
+            min_similarity=min_similarity,
+        )
+        usable: list[dict[str, Any]] = []
+        for target in plan["targets"]:
+            source = prepared.get(str(target.get("face_path")))
+            if source is None:
+                plan["skipped"].append(
+                    {
+                        **_ref_brief(target),
+                        "reason": "参考脸未能载入，无法换脸。",
+                        "score": target.get("score"),
+                    }
+                )
+                continue
+            target["source_key"] = str(target["face_path"])
+            usable.append(target)
+        plan["targets"] = usable
+        _write_plan(workdir, plan)
+        for row in plan["skipped"]:
+            log.warning("已跳过参考脸「%s」：%s", row.get("name") or row.get("face_path"), row.get("reason"))
+        if plan.get("track_note"):
+            log.info("%s", plan["track_note"])
+        if not usable:
+            reasons = "；".join(
+                f"{row.get('name') or row.get('face_path')}：{row.get('reason')}" for row in plan["skipped"]
+            )
+            raise RuntimeError("人物替换没有可确认的目标，已跳过以免换错人。" + (reasons or ""))
+
+        names = "、".join(str(t.get("person_name") or t.get("name") or "") for t in usable)
+        log.info(
+            "执行 L1 人物替换（本地换脸，不是提取了3D模型）。一次处理 %s 个已匹配人物：%s",
+            len(usable),
+            names,
+        )
+        frames = index_swap_frames(track_payload, usable)
+        out_path = workdir / "replaced.mp4"
+        cap = open_capture(video)
+        writer = open_ffmpeg_writer(out_path, info.width, info.height, info.fps, crf=cfg.compose.crf)
+        total = info.frame_count or None
+        pbar = tqdm(total=total, desc="替换", unit="f")
+        frame_idx = 0
+        swapped = 0
+        try:
+            while True:
+                check_cancel()
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                items = frames.get(frame_idx, [])
+                if items:
+                    boxes = [item["bbox"] for item in items]
+                    sources = [prepared.get(item["source_key"]) for item in items]
+                    new_frame = backend.replace_frame(frame, boxes, sources)
+                    if new_frame is not frame:
+                        swapped += 1
+                    frame = new_frame
+                if frame.shape[1] != info.width or frame.shape[0] != info.height:
+                    frame = cv2.resize(frame, (info.width, info.height))
+                writer.stdin.write(np.ascontiguousarray(frame).tobytes())
+                frame_idx += 1
+                pbar.update(1)
+        finally:
+            pbar.close()
+            cap.release()
+            writer.stdin.close()
+            err = writer.communicate()[1]
+            if writer.returncode:
+                raise RuntimeError(f"写出替换视频失败: {(err or b'')[-2000:]}")
     finally:
-        pbar.close()
-        cap.release()
-        writer.stdin.close()
-        err = writer.communicate()[1]
-        if writer.returncode:
-            raise RuntimeError(f"写出替换视频失败: {(err or b'')[-2000:]}")
         backend.unload()
 
     log.info("替换完成: %s 帧中有 %s 帧执行了换脸，输出 %s", frame_idx, swapped, out_path)

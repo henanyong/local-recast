@@ -275,13 +275,12 @@ class RecastService:
                     stages_for = stages
             else:
                 stages_for = stages
-            # pick default authorized character if none specified
+            # One replace pass covers every authorized reference face.
+            # An explicit character_id still limits the job to that person.
             cid = character_id
+            cids: list[str] | None = None
             if "replace" in stages_for and not cid:
-                for ch in self.store.list_characters():
-                    if ch.get("authorized") and ch.get("auth_type"):
-                        cid = ch["id"]
-                        break
+                cids = _authorized_swap_ids(self.store)
             for t in tasks:
                 if t.get("status") == ST_RUNNING:
                     continue
@@ -295,6 +294,7 @@ class RecastService:
                         task_id=t["id"],
                         stages=list(stages_for),
                         character_id=cid,
+                        character_ids=cids,
                         names=None,
                         require_auth=True,
                         entry_type=entry,
@@ -567,6 +567,19 @@ def asset_flags(character: dict[str, Any]) -> dict[str, str]:
         else:
             flags[kind] = "缺失"
     return flags
+
+
+def _authorized_swap_ids(store: Store) -> list[str]:
+    ids: list[str] = []
+    for ch in store.list_characters():
+        if not (ch.get("authorized") and ch.get("auth_type")):
+            continue
+        if any(
+            a.get("kind") == "face" and a.get("path") and Path(str(a["path"])).is_file()
+            for a in (ch.get("assets") or [])
+        ):
+            ids.append(ch["id"])
+    return ids
 
 
 def _missing_list(drama: dict[str, Any]) -> list[str]:

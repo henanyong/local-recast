@@ -25,6 +25,28 @@ models/
 *.srt
 !examples/**
 
+# recast/models is the Python registry package, not a weights directory.
+# `models/` above also matches this path, so force-include it.
+!recast/models/
+!recast/models/**
+# The negation must not re-include weight files. *.pkl is new (FLAME and
+# other pickles); the rest repeat the weight globs so they still win inside
+# the re-included package. examples/ stays un-ignored by the rule above.
+recast/models/*.pt
+recast/models/**/*.pt
+recast/models/*.onnx
+recast/models/**/*.onnx
+recast/models/*.engine
+recast/models/**/*.engine
+recast/models/*.weights
+recast/models/**/*.weights
+recast/models/*.pkl
+recast/models/**/*.pkl
+*.pkl
+# Negation of recast/models/** must not track bytecode.
+__pycache__/
+*.py[cod]
+
 # OS
 Thumbs.db
 Desktop.ini

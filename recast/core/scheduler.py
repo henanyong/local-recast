@@ -29,6 +29,7 @@ class Job:
     task_id: str
     stages: list[str]
     character_id: str | None = None
+    character_ids: list[str] | None = None
     face: str | None = None
     track_id: int | None = None
     names: str | None = None
@@ -309,6 +310,7 @@ class Scheduler:
             config=self._cfg(),
             face=job.face,
             character_id=job.character_id,
+            character_ids=job.character_ids,
             track_id=job.track_id,
             names=job.names,
             lang=settings.lang,
