@@ -805,6 +805,13 @@ def run(
             len(usable),
             names,
         )
+        from recast.stages.track import fill_track_gaps
+
+        track_payload = fill_track_gaps(
+            track_payload,
+            max_gap=int(getattr(cfg.detect, "max_gap_frames", 10) or 10),
+            fps=float(info.fps) if info.fps else None,
+        )
         frames = index_swap_frames(track_payload, usable)
         out_path = workdir / "replaced.mp4"
         cap = open_capture(video)

@@ -45,6 +45,8 @@ class DetectConfig:
     conf: float = 0.4
     iou: float = 0.5
     tracker: str = "bytetrack.yaml"
+    # Fill missing boxes across gaps no longer than this. Longer holes stay empty.
+    max_gap_frames: int = 10
 
 
 @dataclass
