@@ -7,6 +7,7 @@ No official-platform login is built in.
 from __future__ import annotations
 
 import logging
+import shlex
 import shutil
 import subprocess
 import urllib.request
@@ -66,8 +67,8 @@ def run_upload(
         if not command:
             return {"ok": False, "error": "未指定上传命令。"}
         # command may contain {src} and {name}
-        cmd = command.format(src=str(src), name=src.name)
-        proc = subprocess.run(cmd, shell=True, capture_output=True, text=True)
+        argv = [part.format(src=str(src), name=src.name) for part in shlex.split(command)]
+        proc = subprocess.run(argv, shell=False, capture_output=True, text=True)
         return {
             "ok": proc.returncode == 0,
             "skipped": False,

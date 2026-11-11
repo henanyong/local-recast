@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+log = logging.getLogger("recast")
 
 
 def _url(base: str, path: str) -> str:
@@ -70,8 +73,12 @@ def submit_workflow(
             rec = history.get(prompt_id) or history
             if rec.get("status", {}).get("completed") or rec.get("outputs"):
                 break
-        except Exception:
-            pass
+        except urllib.error.URLError as exc:
+            log.warning("ComfyUI 网络错误，继续等待: %s", exc)
+        except TimeoutError as exc:
+            log.warning("ComfyUI 查询超时，继续等待: %s", exc)
+        except Exception as exc:
+            log.warning("ComfyUI 任务查询失败（不是网络错误）: %s", exc)
         time.sleep(poll)
     else:
         raise TimeoutError("等待 ComfyUI 工作流超时")
@@ -91,7 +98,11 @@ def submit_workflow(
                 qs = f"filename={filename}&subfolder={folder}&type={typ}"
                 try:
                     blob = _request(_url(base_url, f"/view?{qs}"), timeout=60)
-                except Exception:
+                except urllib.error.URLError as exc:
+                    log.warning("下载 ComfyUI 输出失败（网络） %s: %s", filename, exc)
+                    continue
+                except Exception as exc:
+                    log.warning("下载 ComfyUI 输出失败（任务） %s: %s", filename, exc)
                     continue
                 target = dest / filename
                 target.write_bytes(blob)

@@ -130,8 +130,10 @@ def run(
         fps=float(info.fps) if info.fps else None,
     )
     out = workdir / "tracks_raw.json"
-    # frames array can be large; still useful. Also write a compact track list.
-    out.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    written = payload
+    if not bool(getattr(cfg.detect, "keep_raw_frames", False)):
+        written = compact_track_payload(payload)
+    out.write_text(json.dumps(written, ensure_ascii=False), encoding="utf-8")
     log.info(
         "跟踪完成: %s 个轨迹, %s 帧。原始数据: %s",
         len(tracks),
@@ -142,6 +144,13 @@ def run(
     model = None
     release_cuda(held)
     return payload
+
+
+def compact_track_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Drop the duplicate per-frame log. Each track still keeps its own boxes."""
+    compact = {key: value for key, value in payload.items() if key != "frames"}
+    compact["frames_omitted"] = True
+    return compact
 
 
 def interpolate_track_frames(
