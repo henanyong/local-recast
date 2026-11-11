@@ -336,8 +336,8 @@ class LibraryWindow(QDialog):
             self,
             "已清理失效样本",
             f"已清理 {result.get('stale_count', 0)} 条失效资料，"
-            f"移出 {result.get('remove_count', 0)} 个未确认人物。\n"
-            "已确认或已授权的人物仍留在人物库中。没有人脸文件的会显示「脸：缺失」。",
+            f"移出 {result.get('remove_count', 0)} 个人物。\n"
+            "仍有人脸文件的人物留在人物库中，只去掉失效资料。",
         )
 
     def _clean_unused_l2(self) -> None:
@@ -396,17 +396,17 @@ def _cleanup_detail(plan: dict) -> str:
     summary = f"失效资料 {plan.get('stale_count', 0)} 条"
     if kind_text:
         summary += f"（{kind_text}）"
-    summary += f"，将移出人物库的未确认人物 {plan.get('remove_count', 0)} 个。"
+    summary += f"，将移出人物库 {plan.get('remove_count', 0)} 人（没有仍有效的人脸文件）。"
     parts = [summary]
     stale = list(plan.get("stale_assets") or [])
     if stale:
         parts.append("失效资料：\n" + "\n".join(_capped_lines(stale)))
     remove = list(plan.get("remove_characters") or [])
     if remove:
-        parts.append("将移出人物库（未确认，且没有仍有效的人脸文件）：\n" + "\n".join(_capped_lines(remove)))
+        parts.append("将移出人物库（没有仍有效的人脸文件，包括已确认和已授权的人物）：\n" + "\n".join(_capped_lines(remove)))
     keep = list(plan.get("keep_characters") or [])
     if keep:
-        parts.append("以下人物已确认或已授权，会留在人物库，只去掉失效资料：\n" + "\n".join(_capped_lines(keep)))
+        parts.append("以下人物仍有人脸文件，会留在人物库，只去掉失效资料：\n" + "\n".join(_capped_lines(keep)))
     parts.append(
         "不会删除仍存在的人脸文件，也不会删除剧集、任务或成片。\n"
         "输出目录以外的参考照片不会删除。仍有效的 3D头像目录不会在这一步删除，"

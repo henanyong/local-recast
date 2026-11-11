@@ -878,13 +878,14 @@ class RecastService:
         }
 
     def list_invalid_samples(self) -> dict[str, Any]:
-        """Describe stale asset rows and unconfirmed people with no valid face.
+        """Describe stale asset rows and people who have no valid face file.
 
         A row is stale when ``path`` is set and the file is gone. For a 3D头像
         asset, the row is stale only when the asset directory itself is gone;
-        a directory that is still there is kept. Confirmed or authorized
-        characters are never removed. Those who still have a stale row are
-        listed under ``keep_characters``.
+        a directory that is still there is kept. Every character with no
+        remaining valid face file is listed for removal, including confirmed
+        and authorized people. Characters who still have a face file stay;
+        those who also have a stale row are listed under ``keep_characters``.
         """
         from recast.assets3d.avatar import asset_directory
 
@@ -912,14 +913,11 @@ class RecastService:
         keep_characters: list[dict[str, Any]] = []
         for ch in characters.values():
             valid_face = _has_valid_face(ch)
-            kept = _character_is_protected(ch)
             has_stale = ch["id"] in stale_by_character
-            if kept:
-                if has_stale:
-                    keep_characters.append(_character_brief(ch, kept=True))
-                continue
             if not valid_face:
                 remove_characters.append(_character_brief(ch, kept=False))
+            elif has_stale:
+                keep_characters.append(_character_brief(ch, kept=True))
 
         kind_counts: dict[str, int] = {}
         for item in stale:
@@ -938,11 +936,13 @@ class RecastService:
         }
 
     def clean_invalid_samples(self) -> dict[str, Any]:
-        """Drop stale asset rows, then drop unconfirmed people with no valid face.
+        """Drop stale asset rows, then drop anyone with no remaining valid face.
 
         Generated sample directories that are already empty may be removed.
         Files that still exist, including a valid L2 directory, are not deleted.
-        Confirmed and authorized characters stay so a new face can be assigned.
+        A person who still has a face file stays, confirmed or not. A person
+        with no remaining face file leaves the library, including when they
+        are confirmed or authorized.
         """
         from recast.core.sample_paths import plan_sample_removal, prune_empty_sample_dirs
 
@@ -969,7 +969,7 @@ class RecastService:
         self.store.delete_characters([item["id"] for item in plan["remove_characters"] if item.get("id")])
         self._on_log(
             "INFO",
-            f"已清理 {plan['stale_count']} 条失效资料，移出 {plan['remove_count']} 个未确认人物。",
+            f"已清理 {plan['stale_count']} 条失效资料，移出 {plan['remove_count']} 个人物。",
         )
         return {**plan, "pruned_dirs": pruned}
 
@@ -1042,11 +1042,6 @@ def _l2_target_present(raw: str) -> bool:
         return path.exists() or path.is_symlink() or directory.exists() or directory.is_symlink()
     except OSError:
         return True
-
-
-def _character_is_protected(character: dict[str, Any]) -> bool:
-    """Confirmed or authorized people stay in the library during sample cleanup."""
-    return _flag_on(character.get("confirmed")) or _flag_on(character.get("authorized"))
 
 
 def _has_valid_face(character: dict[str, Any]) -> bool:

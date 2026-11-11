@@ -256,7 +256,7 @@ def test_shared_sample_and_nested_models_are_not_deleted(tmp_path: Path):
     assert plan_sample_removal(link, output).action == "skip"
 
 
-def test_clean_invalid_samples_keeps_confirmed_and_authorized(tmp_path: Path):
+def test_clean_invalid_samples_removes_people_without_a_valid_face(tmp_path: Path):
     svc = _service(tmp_path)
     output = Path(svc.settings.output_root)
     good = _sample(output, "Person_2", "00_f1.jpg")
@@ -319,26 +319,30 @@ def test_clean_invalid_samples_keeps_confirmed_and_authorized(tmp_path: Path):
     keep_ids = {item["id"] for item in preview["keep_characters"]}
     assert stale_only["id"] in remove_ids
     assert empty_person["id"] in remove_ids
+    assert confirmed["id"] in remove_ids
+    assert authorized["id"] in remove_ids
+    assert confirmed_l2["id"] in remove_ids
     assert good_owner["id"] not in remove_ids
     assert mixed["id"] not in remove_ids
-    assert confirmed["id"] in keep_ids
-    assert authorized["id"] in keep_ids
+    assert live_l2_owner["id"] not in remove_ids
+    assert good_owner["id"] in keep_ids
+    assert mixed["id"] in keep_ids
     assert live_l2_owner["id"] in keep_ids
     assert Path(live_asset["dir"]).resolve() not in {Path(item["path"]).resolve() for item in preview["stale_assets"] if item.get("path")}
     assert any(item["character_id"] == confirmed_l2["id"] and item["kind"] == "3d" for item in preview["stale_assets"])
-    assert any(item["id"] == authorized["id"] and "Person_20" in item["label"] for item in preview["keep_characters"])
+    assert any(item["id"] == authorized["id"] and "Person_20" in item["label"] for item in preview["remove_characters"])
 
     result = svc.clean_invalid_samples()
-    assert result["remove_count"] >= 2
+    assert result["remove_count"] >= 5
     ids = {row["id"] for row in svc.characters()}
     assert stale_only["id"] not in ids
     assert empty_person["id"] not in ids
+    assert confirmed["id"] not in ids
+    assert authorized["id"] not in ids
+    assert confirmed_l2["id"] not in ids
     assert good_owner["id"] in ids
     assert mixed["id"] in ids
-    assert confirmed["id"] in ids
-    assert authorized["id"] in ids
     assert live_l2_owner["id"] in ids
-    assert confirmed_l2["id"] in ids
 
     assert good.is_file() and mixed_face.is_file() and costume_keep.is_file()
     assert video.is_file()
@@ -356,22 +360,16 @@ def test_clean_invalid_samples_keeps_confirmed_and_authorized(tmp_path: Path):
     assert asset_flags(kept_mix)["costume"] == "已齐"
     assert not any(row.get("path") == str(tmp_path / "missing-coat.png") for row in kept_mix["assets"])
 
-    for cid in (confirmed["id"], authorized["id"]):
-        saved = svc.store.get_character(cid)
-        assert saved is not None
-        assert not any(row.get("kind") == "face" for row in saved["assets"])
-        flags = asset_flags(saved)
-        assert flags["face"] == "缺失"
+    assert svc.store.get_character(confirmed["id"]) is None
+    assert svc.store.get_character(authorized["id"]) is None
 
     saved_l2 = svc.store.get_character(live_l2_owner["id"])
     assert any(row.get("kind") == "3d" and Path(row["path"]).parent.is_dir() for row in saved_l2["assets"])
     assert asset_flags(saved_l2)["3d"] in {"已齐", "偏低"}
+    assert asset_flags(saved_l2)["face"] == "已齐"
     assert not any(row.get("kind") == "face" and row.get("path") and not Path(str(row["path"])).is_file() for row in saved_l2["assets"])
-
-    saved_missing_l2 = svc.store.get_character(confirmed_l2["id"])
-    assert not any(row.get("kind") in {"3d", "3d_avatar"} for row in saved_missing_l2["assets"])
-    assert asset_flags(saved_missing_l2)["3d"] == "缺失"
     assert svc.list_invalid_samples()["stale_count"] == 0
+    assert svc.list_invalid_samples()["remove_count"] == 0
 
 
 def test_library_window_delete_button_follows_selection(tmp_path: Path):
@@ -414,13 +412,15 @@ def test_clean_invalid_samples_leaves_a_valid_l2_directory(tmp_path: Path):
     ch = svc.add_character_manual("临时", str(photo))
     svc.confirm_character(ch["id"], authorized=True, auth_type=AUTH_OWN_GEN)
     asset = svc.build_l2(ch["id"], [str(photo)])
-    svc.store.update("characters", ch["id"], confirmed=0, authorized=0, auth_type=None)
     svc.store.set_character_asset(
         ch["id"],
         "face",
         str(output / "workbench" / "job" / "face_samples" / "临时" / "gone.jpg"),
         complete=True,
     )
+    still = svc.store.get_character(ch["id"])
+    assert still["authorized"] and still["confirmed"]
+    assert ch["id"] in {item["id"] for item in svc.list_invalid_samples()["remove_characters"]}
 
     svc.clean_invalid_samples()
     assert svc.store.get_character(ch["id"]) is None
@@ -443,7 +443,9 @@ def test_cleanup_detail_caps_the_preview_list():
     }
     text = _cleanup_detail(plan)
     assert "失效资料 31 条（脸 31）" in text
-    assert "将移出人物库的未确认人物 2 个" in text
+    assert "将移出人物库 2 人（没有仍有效的人脸文件）" in text
+    assert "包括已确认和已授权的人物" in text
+    assert "仍有人脸文件，会留在人物库" in text
     assert "Person_0（id0）" in text
     assert "Person_29（id29）" in text
     assert "Person_30（id30）" not in text
