@@ -11,6 +11,14 @@ from recast.ffmpeg import VideoInfo
 
 log = logging.getLogger("recast")
 
+# Bottom band of the frame. Signs and posters above this line are not captions.
+DEFAULT_BAND_TOP = 0.72
+DEFAULT_MIN_CONF = 0.5
+DEFAULT_MERGE_SIMILAR = 0.72
+DEFAULT_MERGE_GAP = 0.8
+# Half-window around the frame that was actually decoded, not a fixed ±0.6s.
+DEFAULT_WINDOW_HALF = 0.45
+
 
 def ocr_available() -> tuple[bool, str]:
     try:
@@ -106,11 +114,145 @@ def _parse_rapidocr(result: Any) -> list[tuple[str, float]]:
     return items
 
 
+def subtitle_band(frame: Any, *, top_ratio: float = DEFAULT_BAND_TOP) -> Any:
+    """Crop to the bottom subtitle band. ``top_ratio`` is the first row kept."""
+    import numpy as np
+
+    arr = np.asarray(frame)
+    if arr.ndim < 2 or arr.shape[0] <= 1:
+        return arr
+    ratio = min(max(float(top_ratio), 0.0), 0.95)
+    y0 = int(arr.shape[0] * ratio)
+    if y0 >= arr.shape[0]:
+        y0 = arr.shape[0] - 1
+    return arr[y0:]
+
+
+def filter_ocr_parts(
+    parts: list[tuple[str, float]],
+    *,
+    min_conf: float = DEFAULT_MIN_CONF,
+) -> list[tuple[str, float]]:
+    kept: list[tuple[str, float]] = []
+    for text, score in parts:
+        if not str(text).strip():
+            continue
+        try:
+            conf = float(score)
+        except (TypeError, ValueError):
+            continue
+        if conf < min_conf:
+            continue
+        kept.append((str(text).strip(), conf))
+    return kept
+
+
+def plan_decoded_frames(
+    sample_times: list[float],
+    *,
+    fps: float,
+    frame_count: int,
+) -> list[tuple[int, float, float]]:
+    """Walk frames forward and pick the first decoded frame at or after each sample.
+
+    Returns ``(frame_index, actual_time, requested_time)``. The index never moves
+    backward. A sample past the last frame is dropped instead of seeking.
+    """
+    if frame_count <= 0:
+        return []
+    rate = fps if fps and fps > 0 else 25.0
+    frame_idx = 0
+    chosen: list[tuple[int, float, float]] = []
+    for requested in sample_times:
+        while frame_idx < frame_count - 1 and (frame_idx / rate) + 1e-9 < requested:
+            frame_idx += 1
+        actual = frame_idx / rate
+        if actual + 1e-9 < requested:
+            continue
+        chosen.append((frame_idx, actual, float(requested)))
+    return chosen
+
+
+def windows_for_hits(
+    hits: list[dict[str, Any]],
+    *,
+    max_half: float = DEFAULT_WINDOW_HALF,
+) -> list[dict[str, Any]]:
+    """Time each hit from the decoded frame, halfway to its neighbors, capped."""
+    out: list[dict[str, Any]] = []
+    for i, hit in enumerate(hits):
+        row = dict(hit)
+        t = float(hit.get("time", hit.get("start") or 0.0))
+        prev_t = float(hits[i - 1].get("time", hits[i - 1].get("start") or 0.0)) if i else None
+        next_t = float(hits[i + 1]["time"]) if i + 1 < len(hits) and hits[i + 1].get("time") is not None else None
+        if next_t is None and i + 1 < len(hits):
+            next_t = float(hits[i + 1].get("start") or t)
+        back = max_half if prev_t is None else min(max_half, max(0.0, (t - prev_t) / 2.0))
+        fwd = max_half if next_t is None else min(max_half, max(0.0, (next_t - t) / 2.0))
+        row["time"] = t
+        row["start"] = max(0.0, t - back)
+        row["end"] = t + max(fwd, 0.05)
+        out.append(row)
+    return out
+
+
+def merge_ocr_hits(
+    segments: list[dict[str, Any]],
+    *,
+    similar: float = DEFAULT_MERGE_SIMILAR,
+    gap: float = DEFAULT_MERGE_GAP,
+) -> list[dict[str, Any]]:
+    """Merge consecutive hits by sequence similarity, not exact text equality."""
+    from recast.extract.merge_subs import text_similarity
+
+    merged: list[dict[str, Any]] = []
+    for seg in segments:
+        text = str(seg.get("text") or "").strip()
+        if not text:
+            continue
+        row = dict(seg)
+        row["text"] = text
+        if not merged:
+            merged.append(row)
+            continue
+        prev = merged[-1]
+        close = float(row.get("start") or 0.0) <= float(prev.get("end") or 0.0) + gap
+        if close and text_similarity(prev.get("text") or "", row["text"]) >= similar:
+            prev["end"] = max(float(prev.get("end") or 0.0), float(row.get("end") or 0.0))
+            if float(row.get("conf") or 0.0) > float(prev.get("conf") or 0.0):
+                prev["text"] = row["text"]
+                prev["conf"] = row.get("conf")
+        else:
+            merged.append(row)
+    return merged
+
+
+def _ocr_band(engine: Any, frame: Any, *, band_top: float, min_conf: float) -> tuple[str, float] | None:
+    band = subtitle_band(frame, top_ratio=band_top)
+    try:
+        result = engine(band)
+    except Exception as exc:
+        log.warning("OCR 字幕带失败: %s", exc)
+        return None
+    parts = filter_ocr_parts(_parse_rapidocr(result), min_conf=min_conf)
+    if not parts:
+        return None
+    text = " ".join(text for text, _score in parts)
+    conf = sum(score for _text, score in parts) / len(parts)
+    return text, conf
+
+
 def run(
     video: str | Path,
     workdir: Path,
     info: VideoInfo,
     shots: list[dict[str, Any]] | None = None,
+    *,
+    band_top: float = DEFAULT_BAND_TOP,
+    min_conf: float = DEFAULT_MIN_CONF,
+    merge_similar: float = DEFAULT_MERGE_SIMILAR,
+    merge_gap: float = DEFAULT_MERGE_GAP,
+    window_half: float = DEFAULT_WINDOW_HALF,
 ) -> tuple[Path, list[dict[str, Any]]]:
     """OCR sampled frames and write ocr.json / ocr.srt. Always writes files."""
     from recast.device import release_cuda
@@ -133,47 +275,51 @@ def run(
     times = _sample_times(list(shots or []), info)
     cap = open_capture(video)
     fps = info.fps or 25.0
-    segments: list[dict[str, Any]] = []
+    if fps <= 0:
+        fps = 25.0
+    pending = list(times)
+    hits: list[dict[str, Any]] = []
+    frame_idx = 0
     try:
-        for t in times:
+        while pending:
             check_cancel()
-            frame_idx = max(0, int(round(t * fps)))
-            cap.set(1, frame_idx)  # cv2.CAP_PROP_POS_FRAMES
             ok_f, frame = cap.read()
             if not ok_f or frame is None:
-                continue
-            try:
-                result = engine(frame)
-            except TypeError:
-                # some versions want a path
-                result = engine(frame)
-            except Exception as exc:
-                log.warning("OCR 帧 %s 失败: %s", frame_idx, exc)
-                continue
-            parts = _parse_rapidocr(result)
-            if not parts:
-                continue
-            text = " ".join(p[0] for p in parts)
-            conf = sum(p[1] for p in parts) / max(1, len(parts))
-            # each sample covers a small window around the frame
-            start = max(0.0, t - 0.6)
-            end = t + 0.6
-            segments.append({"start": start, "end": end, "text": text, "conf": conf, "frame_idx": frame_idx})
+                break
+            actual = frame_idx / fps
+            due = False
+            while pending and actual + 1e-9 >= pending[0]:
+                pending.pop(0)
+                due = True
+            if due:
+                recognized = _ocr_band(engine, frame, band_top=band_top, min_conf=min_conf)
+                if recognized:
+                    text, conf = recognized
+                    hits.append(
+                        {
+                            "time": actual,
+                            "text": text,
+                            "conf": conf,
+                            "frame_idx": frame_idx,
+                        }
+                    )
+            frame_idx += 1
     finally:
         cap.release()
         held = engine
         engine = None
         release_cuda(held)
 
-    # merge consecutive similar OCR hits
-    merged: list[dict[str, Any]] = []
-    for seg in segments:
-        if merged and seg["text"] == merged[-1]["text"] and seg["start"] <= merged[-1]["end"] + 0.8:
-            merged[-1]["end"] = max(merged[-1]["end"], seg["end"])
-        else:
-            merged.append(dict(seg))
+    timed = windows_for_hits(hits, max_half=window_half)
+    merged = merge_ocr_hits(timed, similar=merge_similar, gap=merge_gap)
 
-    payload = {"backend": backend, "skipped": False, "segments": merged}
+    payload = {
+        "backend": backend,
+        "skipped": False,
+        "band_top": band_top,
+        "min_conf": min_conf,
+        "segments": merged,
+    }
     json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     write_srt(merged, srt_path)
     log.info("OCR 完成（%s）: %s 段，写出 %s", backend, len(merged), srt_path)
