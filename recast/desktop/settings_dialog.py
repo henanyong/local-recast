@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
     QGroupBox,
@@ -33,8 +34,21 @@ class SettingsDialog(QDialog):
         self.service = service
         self.secrets = SecretStore()
         self.setWindowTitle("设置")
-        self.resize(620, 680)
+        self.resize(640, 860)
         s = service.settings
+        from recast.config import RecastConfig, resolve_config_path
+
+        try:
+            preset = RecastConfig.from_yaml(resolve_config_path(s.config_file()))
+        except Exception:
+            preset = None
+        crf_value = int(s.export_crf if s.export_crf else (preset.compose.crf if preset else 18))
+        nvenc_value = bool(preset.compose.use_nvenc) if s.use_nvenc is None else bool(s.use_nvenc)
+        scene_value = float(s.scene_threshold if s.scene_threshold is not None else (preset.scene.threshold if preset else 27))
+        min_shot_value = float(s.min_shot_sec if s.min_shot_sec is not None else (preset.scene.min_shot_sec if preset else 0.4))
+        pose_quality = s.pose_quality or (preset.pose.quality if preset else "accuracy")
+        pose_every = int(s.pose_sample_every or (preset.pose.sample_every if preset else 2))
+        detect_every = int(s.detect_every or (preset.replace.detect_every if preset else 4))
 
         self.tier = QComboBox()
         self.tier.addItem("基础档（无独立 GPU，禁用重生成 / L2 驱动）", "basic")
@@ -73,6 +87,43 @@ class SettingsDialog(QDialog):
         hf.addRow("", self.burn)
         hf.addRow("", self.pose)
         layout.addWidget(hard)
+
+        precision = QGroupBox("导出与精度")
+        pf = QFormLayout(precision)
+        self.nvenc = QCheckBox("优先 NVENC（不可用或失败时回退 libx264）")
+        self.nvenc.setChecked(nvenc_value)
+        self.crf = QSpinBox()
+        self.crf.setRange(1, 51)
+        self.crf.setValue(crf_value)
+        self.scene_threshold = QDoubleSpinBox()
+        self.scene_threshold.setRange(1.0, 80.0)
+        self.scene_threshold.setSingleStep(1.0)
+        self.scene_threshold.setDecimals(1)
+        self.scene_threshold.setValue(scene_value)
+        self.min_shot = QDoubleSpinBox()
+        self.min_shot.setRange(0.0, 10.0)
+        self.min_shot.setSingleStep(0.1)
+        self.min_shot.setDecimals(2)
+        self.min_shot.setValue(min_shot_value)
+        self.pose_quality = QComboBox()
+        self.pose_quality.addItem("逐帧 + 平滑（精度）", "accuracy")
+        self.pose_quality.addItem("抽帧（速度）", "speed")
+        pq = self.pose_quality.findData(pose_quality if pose_quality in {"accuracy", "speed"} else "accuracy")
+        self.pose_quality.setCurrentIndex(max(0, pq))
+        self.pose_every = QSpinBox()
+        self.pose_every.setRange(1, 30)
+        self.pose_every.setValue(max(1, pose_every))
+        self.detect_every = QSpinBox()
+        self.detect_every.setRange(1, 60)
+        self.detect_every.setValue(max(1, detect_every))
+        pf.addRow("", self.nvenc)
+        pf.addRow("CRF / NVENC CQ", self.crf)
+        pf.addRow("切镜阈值", self._hint_row(self.scene_threshold, "PySceneDetect 与 FFmpeg 共用"))
+        pf.addRow("最短镜头（秒）", self.min_shot)
+        pf.addRow("姿态", self.pose_quality)
+        pf.addRow("抽帧间隔", self._hint_row(self.pose_every, "只在「抽帧」时使用"))
+        pf.addRow("换脸全图检测间隔", self._hint_row(self.detect_every, "中间帧只检测轨迹框"))
+        layout.addWidget(precision)
 
         dirs = QGroupBox("目录与本地生成")
         df = QFormLayout(dirs)
@@ -187,6 +238,13 @@ class SettingsDialog(QDialog):
             lang=self.lang.currentData(),
             burn_subs=self.burn.isChecked(),
             with_pose=self.pose.isChecked(),
+            use_nvenc=self.nvenc.isChecked(),
+            export_crf=int(self.crf.value()),
+            scene_threshold=float(self.scene_threshold.value()),
+            min_shot_sec=float(self.min_shot.value()),
+            pose_quality=self.pose_quality.currentData(),
+            pose_sample_every=int(self.pose_every.value()),
+            detect_every=int(self.detect_every.value()),
             cloud_enabled=self.cloud_enabled.isChecked(),
             auto_upload=self.auto_upload.isChecked(),
             auto_upload_enabled=True,

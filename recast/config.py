@@ -72,6 +72,11 @@ class PoseConfig:
     mode: str = "lightweight"
     overlay: bool = True
     export_smpl_hook: bool = True
+    # accuracy: every frame plus smoothing. speed: sample every sample_every frames.
+    quality: str = "accuracy"
+    sample_every: int = 2
+    smooth: bool = True
+    min_pose_iou: float = 0.3
 
 
 @dataclass
@@ -81,11 +86,24 @@ class ReplaceConfig:
     model_url: str = (
         "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
     )
+    # Full-frame detection runs every N frames. Intermediate frames search the track crop.
+    detect_every: int = 4
+    # Weight of the current swapped face. 1 disables temporal blending.
+    temporal_alpha: float = 0.62
+
+
+@dataclass
+class SceneConfig:
+    # PySceneDetect content threshold. The FFmpeg fallback is calibrated from this
+    # (27 -> scene score 0.30) so the two backends share one sensitivity.
+    threshold: float = 27.0
+    min_shot_sec: float = 0.4
 
 
 @dataclass
 class ComposeConfig:
     crf: int = 18
+    use_nvenc: bool = True
     audio: str = "original"
     burn_subs: bool = False
 
@@ -101,6 +119,7 @@ class RecastConfig:
     identity: IdentityConfig = field(default_factory=IdentityConfig)
     pose: PoseConfig = field(default_factory=PoseConfig)
     replace: ReplaceConfig = field(default_factory=ReplaceConfig)
+    scene: SceneConfig = field(default_factory=SceneConfig)
     compose: ComposeConfig = field(default_factory=ComposeConfig)
     path: Path | None = None
     raw: dict[str, Any] = field(default_factory=dict)
@@ -122,6 +141,7 @@ class RecastConfig:
             "identity",
             "pose",
             "replace",
+            "scene",
             "compose",
         }
         _warn_unknown([k for k in raw if k not in known_top], cfg_path.name)
@@ -135,11 +155,40 @@ class RecastConfig:
             identity=_merge(IdentityConfig, raw.get("identity"), where="identity"),
             pose=_merge(PoseConfig, raw.get("pose"), where="pose"),
             replace=_merge(ReplaceConfig, raw.get("replace"), where="replace"),
+            scene=_merge(SceneConfig, raw.get("scene"), where="scene"),
             compose=_merge(ComposeConfig, raw.get("compose"), where="compose"),
             path=cfg_path,
             raw=raw,
         )
         return cfg
+
+
+def apply_runtime_settings(cfg: RecastConfig, settings: Any | None) -> RecastConfig:
+    """Copy optional desktop overrides onto a loaded preset. Unset values keep the yaml."""
+    if settings is None:
+        return cfg
+    crf = getattr(settings, "export_crf", None)
+    if crf not in (None, "", 0):
+        cfg.compose.crf = int(crf)
+    nvenc = getattr(settings, "use_nvenc", None)
+    if nvenc is not None:
+        cfg.compose.use_nvenc = bool(nvenc)
+    threshold = getattr(settings, "scene_threshold", None)
+    if threshold not in (None, ""):
+        cfg.scene.threshold = float(threshold)
+    min_shot = getattr(settings, "min_shot_sec", None)
+    if min_shot not in (None, ""):
+        cfg.scene.min_shot_sec = float(min_shot)
+    quality = getattr(settings, "pose_quality", None)
+    if quality:
+        cfg.pose.quality = str(quality)
+    every = getattr(settings, "pose_sample_every", None)
+    if every not in (None, "", 0):
+        cfg.pose.sample_every = max(1, int(every))
+    detect = getattr(settings, "detect_every", None)
+    if detect not in (None, "", 0):
+        cfg.replace.detect_every = max(1, int(detect))
+    return cfg
 
 
 def resolve_config_path(value: str | Path | None) -> Path:

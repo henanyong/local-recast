@@ -13,11 +13,90 @@ from recast.runtime import check_cancel
 
 log = logging.getLogger("recast")
 
+# ContentDetector's historical default and this project's FFmpeg default describe
+# the same sensitivity. A higher threshold means fewer cuts on both backends.
+CONTENT_ANCHOR = 27.0
+FFMPEG_SCORE_AT_CONTENT_27 = 0.30
+DEFAULT_MIN_SHOT_SEC = 0.4
 
-def _shots_payload(video: Path, info: VideoInfo, shots: list[dict[str, Any]], backend: str) -> dict[str, Any]:
+BACKEND_LABELS = {
+    "pyscenedetect": "PySceneDetect",
+    "ffmpeg": "FFmpeg",
+    "ffmpeg+single": "FFmpeg（整段一个镜头）",
+    "pyscenedetect+single": "PySceneDetect（整段一个镜头）",
+}
+
+
+def ffmpeg_scene_score(content_threshold: float) -> float:
+    """Map a PySceneDetect content threshold onto FFmpeg's 0–1 scene score.
+
+    27 maps to 0.30, which is the pair this project used as its two defaults.
+    The scale is linear through that anchor so changing the one user threshold
+    moves both detectors together.
+    """
+    score = float(content_threshold) * (FFMPEG_SCORE_AT_CONTENT_27 / CONTENT_ANCHOR)
+    return min(0.99, max(0.01, score))
+
+
+def backend_label(name: str | None) -> str:
+    if not name:
+        return ""
+    return BACKEND_LABELS.get(name, name)
+
+
+def _reindex(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for i, shot in enumerate(shots):
+        row = dict(shot)
+        row["index_no"] = i
+        out.append(row)
+    return out
+
+
+def merge_short_shots(shots: list[dict[str, Any]], min_shot_sec: float) -> list[dict[str, Any]]:
+    """Fold flashes and other sub-minimum shots into a neighbor.
+
+    A short first shot extends the next one. Later short shots extend the
+    previous one. The whole timeline stays covered.
+    """
+    rows = [dict(shot) for shot in shots]
+    if min_shot_sec <= 0 or len(rows) < 2:
+        return _reindex(rows)
+
+    def _dur(shot: dict[str, Any]) -> float:
+        return float(shot["end_time"]) - float(shot["start_time"])
+
+    while len(rows) >= 2 and _dur(rows[0]) < min_shot_sec:
+        rows[1]["start_time"] = rows[0]["start_time"]
+        rows[1]["start_frame"] = rows[0]["start_frame"]
+        rows.pop(0)
+    merged: list[dict[str, Any]] = [rows[0]]
+    for shot in rows[1:]:
+        if _dur(shot) < min_shot_sec:
+            merged[-1]["end_time"] = shot["end_time"]
+            merged[-1]["end_frame"] = shot["end_frame"]
+        else:
+            merged.append(shot)
+    return _reindex(merged)
+
+
+def _shots_payload(
+    video: Path,
+    info: VideoInfo,
+    shots: list[dict[str, Any]],
+    backend: str,
+    *,
+    threshold: float,
+    ffmpeg_score: float,
+    min_shot_sec: float,
+) -> dict[str, Any]:
     return {
         "video": str(video),
         "backend": backend,
+        "backend_label": backend_label(backend),
+        "threshold": float(threshold),
+        "ffmpeg_score": float(ffmpeg_score),
+        "min_shot_sec": float(min_shot_sec),
         "fps": info.fps,
         "duration": info.duration,
         "frame_count": info.frame_count,
@@ -137,22 +216,41 @@ def detect_scenes(
     workdir: Path,
     *,
     info: VideoInfo | None = None,
-    threshold: float = 27.0,
-    ffmpeg_score: float = 0.3,
+    threshold: float = CONTENT_ANCHOR,
+    ffmpeg_score: float | None = None,
+    min_shot_sec: float = DEFAULT_MIN_SHOT_SEC,
 ) -> dict[str, Any]:
     src = Path(video)
     workdir.mkdir(parents=True, exist_ok=True)
     meta = info or probe_video(src)
+    score = ffmpeg_scene_score(threshold) if ffmpeg_score is None else float(ffmpeg_score)
     shots = _detect_pyscenedetect(src, meta, threshold)
     backend = "pyscenedetect"
     if shots is None:
-        shots = _detect_ffmpeg(src, meta, ffmpeg_score)
+        shots = _detect_ffmpeg(src, meta, score)
         backend = "ffmpeg"
     if not shots:
         shots = _shots_from_cuts([], meta)
         backend = backend + "+single"
-    payload = _shots_payload(src, meta, shots, backend)
+    shots = merge_short_shots(shots, float(min_shot_sec))
+    payload = _shots_payload(
+        src,
+        meta,
+        shots,
+        backend,
+        threshold=float(threshold),
+        ffmpeg_score=score,
+        min_shot_sec=float(min_shot_sec),
+    )
     path = workdir / "shots.json"
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    log.info("切镜完成（%s）: %s 个镜头，写出 %s", backend, len(shots), path)
+    log.info(
+        "切镜完成（%s，阈值 %.2f / FFmpeg scene>%.3f，最短 %.2fs）: %s 个镜头，写出 %s",
+        backend_label(backend),
+        float(threshold),
+        score,
+        float(min_shot_sec),
+        len(shots),
+        path,
+    )
     return payload

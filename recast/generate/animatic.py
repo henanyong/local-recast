@@ -6,11 +6,10 @@ This is labelled 「分镜预览成片」— not full generative video, and not 
 from __future__ import annotations
 
 import logging
-import subprocess
 from pathlib import Path
 from typing import Any
 
-from recast.ffmpeg import run_ffmpeg, which_ffmpeg
+from recast.ffmpeg import H264_SLOT, run_concat, run_h264
 
 log = logging.getLogger("recast")
 
@@ -89,7 +88,17 @@ def _cover(img: Any, width: int, height: int) -> Any:
     return new.crop((left, top, left + width, top + height))
 
 
-def _ffmpeg_kenburns(still: Path, dest: Path, duration: float, width: int, height: int, fps: int) -> Path:
+def _ffmpeg_kenburns(
+    still: Path,
+    dest: Path,
+    duration: float,
+    width: int,
+    height: int,
+    fps: int,
+    *,
+    crf: int = 18,
+    use_nvenc: bool | None = None,
+) -> Path:
     frames = max(int(round(duration * fps)), fps)
     # Slow zoom 1.0 → 1.08 over the shot. Held-frame if duration is tiny.
     zstep = 0.08 / max(frames, 1)
@@ -100,7 +109,7 @@ def _ffmpeg_kenburns(still: Path, dest: Path, duration: float, width: int, heigh
         f":d=1:s={width}x{height}:fps={fps},"
         f"fps={fps},format=yuv420p"
     )
-    run_ffmpeg(
+    run_h264(
         [
             "-y",
             "-loop",
@@ -112,12 +121,11 @@ def _ffmpeg_kenburns(still: Path, dest: Path, duration: float, width: int, heigh
             "-t",
             f"{duration:.3f}",
             "-an",
-            "-c:v",
-            "libx264",
-            "-pix_fmt",
-            "yuv420p",
+            H264_SLOT,
             str(dest),
-        ]
+        ],
+        crf=crf,
+        use_nvenc=use_nvenc,
     )
     return dest
 
@@ -130,6 +138,8 @@ def build_shot_clip(
     width: int = 720,
     height: int = 1280,
     fps: int = 24,
+    crf: int = 18,
+    use_nvenc: bool | None = None,
 ) -> Path:
     duration = float(shot.get("duration_sec") or 0)
     if duration <= 0 and shot.get("start_time") is not None and shot.get("end_time") is not None:
@@ -145,11 +155,11 @@ def build_shot_clip(
         if not still.is_file():
             still = dest.parent / (dest.stem + ".still.jpg")
     try:
-        _ffmpeg_kenburns(still, dest, duration, width, height, fps)
+        _ffmpeg_kenburns(still, dest, duration, width, height, fps, crf=crf, use_nvenc=use_nvenc)
     except Exception as exc:
         log.warning("Ken Burns 失败，改为静帧拉长时间: %s", exc)
         # held frame
-        run_ffmpeg(
+        run_h264(
             [
                 "-y",
                 "-loop",
@@ -161,12 +171,11 @@ def build_shot_clip(
                 "-vf",
                 f"scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},fps={fps},format=yuv420p",
                 "-an",
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
+                H264_SLOT,
                 str(dest),
-            ]
+            ],
+            crf=crf,
+            use_nvenc=use_nvenc,
         )
     return dest
 
@@ -179,6 +188,8 @@ def build_animatic(
     width: int = 720,
     height: int = 1280,
     fps: int = 24,
+    crf: int = 18,
+    use_nvenc: bool | None = None,
 ) -> dict[str, Any]:
     """Build one silent clip per shot and a concatenated silent picture track."""
     workdir = Path(workdir)
@@ -197,14 +208,23 @@ def build_animatic(
                 token = item.get("file") if isinstance(item, dict) else item
                 if token and Path(str(token)).is_file():
                     refs.append(Path(str(token)))
-        path = build_shot_clip(shot, dest, refs=refs, width=width, height=height, fps=fps)
+        path = build_shot_clip(
+            shot,
+            dest,
+            refs=refs,
+            width=width,
+            height=height,
+            fps=fps,
+            crf=crf,
+            use_nvenc=use_nvenc,
+        )
         shot["output_path"] = str(path)
         shot["animatic"] = True
         clips.append(path)
 
     silent = workdir / "silent.mp4"
     if clips:
-        _concat(clips, silent)
+        _concat(clips, silent, crf=crf, use_nvenc=use_nvenc)
     return {
         "label": ANIMATIC_LABEL,
         "note": ANIMATIC_NOTE,
@@ -214,7 +234,13 @@ def build_animatic(
     }
 
 
-def _concat(clips: list[Path], dest: Path) -> Path:
+def _concat(
+    clips: list[Path],
+    dest: Path,
+    *,
+    crf: int = 18,
+    use_nvenc: bool | None = None,
+) -> Path:
     lst = dest.parent / "silent_concat.txt"
     lines = []
     for c in clips:
@@ -222,24 +248,4 @@ def _concat(clips: list[Path], dest: Path) -> Path:
         s = str(c.resolve()).replace("'", "'\\''")
         lines.append(f"file '{s}'")
     lst.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        run_ffmpeg(["-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(dest)])
-    except Exception:
-        run_ffmpeg(
-            [
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(lst),
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-an",
-                str(dest),
-            ]
-        )
-    return dest
+    return run_concat(lst, dest, crf=crf, use_nvenc=use_nvenc)

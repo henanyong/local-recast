@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import shutil
@@ -99,10 +100,36 @@ class RecastService:
             from recast.ffmpeg import set_ffmpeg_dir
 
             set_ffmpeg_dir(s.ffmpeg_dir)
+        from recast.core.engine import clear_engine_cache
+
+        clear_engine_cache()
         return s
 
     def engine(self) -> dict[str, Any]:
         return engine_snapshot(self.settings, running=self.scheduler.running)
+
+    def _scene_run(self, task_id: str | None) -> dict[str, Any]:
+        if not task_id:
+            return {}
+        task = self.store.get("tasks", task_id)
+        work = (task or {}).get("workdir")
+        if not work:
+            return {}
+        path = Path(work) / "shots.json"
+        if not path.is_file():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {
+            "backend": data.get("backend"),
+            "backend_label": data.get("backend_label"),
+            "threshold": data.get("threshold"),
+            "min_shot_sec": data.get("min_shot_sec"),
+        }
 
     def first_run(self) -> dict[str, Any]:
         return first_run_report(self.settings)
@@ -117,6 +144,7 @@ class RecastService:
             "version": __version__,
             "dramas": dramas,
             "engine": self.engine(),
+            "scene_run": self._scene_run(sched.get("current_task_id")),
             "scheduler": sched,
             "settings": self.settings.to_dict(),
             "stages": [{"id": i, "label": l} for i, l, _ in STAGE_GROUPS],

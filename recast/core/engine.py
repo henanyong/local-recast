@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +126,91 @@ def module_status() -> dict[str, bool]:
     return out
 
 
+_HEAVY_TTL = 5.0
+_heavy_cache: tuple[float, tuple, dict[str, Any]] | None = None
+_comfy_cache: dict[str, tuple[float, bool]] = {}
+
+
+def clear_engine_cache() -> None:
+    """Drop cached GPU / config / ComfyUI probe results."""
+    global _heavy_cache
+    _heavy_cache = None
+    _comfy_cache.clear()
+
+
+def cached_comfy_available(base_url: str | None, *, ttl: float = _HEAVY_TTL, now: float | None = None) -> bool:
+    """ComfyUI's probe uses a 1s timeout. Reuse the last answer for a few seconds."""
+    from recast.generate.comfy import comfy_available
+
+    key = base_url or ""
+    clock = time.monotonic() if now is None else now
+    hit = _comfy_cache.get(key)
+    if hit is not None and clock - hit[0] < ttl:
+        return hit[1]
+    ok = bool(key) and comfy_available(base_url)
+    _comfy_cache[key] = (clock, ok)
+    return ok
+
+
+def _heavy_snapshot(settings: AppSettings, cfg: RecastConfig | None) -> dict[str, Any]:
+    global _heavy_cache
+    key = (
+        settings.hardware_tier,
+        settings.ffmpeg_dir,
+        settings.output_root,
+        getattr(settings, "comfyui_url", "") or "",
+        settings.config_file(),
+        getattr(settings, "export_crf", None),
+        getattr(settings, "use_nvenc", None),
+        getattr(settings, "scene_threshold", None),
+        getattr(settings, "min_shot_sec", None),
+    )
+    now = time.monotonic()
+    if _heavy_cache is not None and _heavy_cache[1] == key and now - _heavy_cache[0] < _HEAVY_TTL:
+        return _heavy_cache[2]
+    vram = detect_vram_gb()
+    gpu = detect_gpu_name()
+    if cfg is None:
+        try:
+            from recast.config import apply_runtime_settings
+
+            cfg = apply_runtime_settings(
+                RecastConfig.from_yaml(resolve_config_path(settings.config_file())),
+                settings,
+            )
+        except Exception:
+            cfg = None
+    models = status_report(cfg)
+    ffm = ffmpeg_status(settings.ffmpeg_dir)
+    mods = module_status()
+    from recast.assets3d.drive import liveportrait_available
+
+    comfy_url = getattr(settings, "comfyui_url", "") or ""
+    scene = {
+        "threshold": float(cfg.scene.threshold) if cfg is not None else 27.0,
+        "min_shot_sec": float(cfg.scene.min_shot_sec) if cfg is not None else 0.4,
+        "installed": "pyscenedetect" if mods.get("scenedetect") else "ffmpeg",
+    }
+    encode = {
+        "crf": int(cfg.compose.crf) if cfg is not None else 18,
+        "use_nvenc": bool(cfg.compose.use_nvenc) if cfg is not None else True,
+    }
+    data = {
+        "vram_gb": vram,
+        "gpu_name": gpu,
+        "ffmpeg": ffm,
+        "modules": mods,
+        "models": models,
+        "disk_free_gb": disk_free_gb(settings.output_root or "."),
+        "comfyui": {"url": comfy_url, "ok": cached_comfy_available(comfy_url or None)},
+        "liveportrait": liveportrait_available(),
+        "scene": scene,
+        "encode": encode,
+    }
+    _heavy_cache = (now, key, data)
+    return data
+
+
 def engine_snapshot(
     settings: AppSettings | None = None,
     *,
@@ -132,19 +218,15 @@ def engine_snapshot(
     cfg: RecastConfig | None = None,
 ) -> dict[str, Any]:
     settings = settings or AppSettings()
-    vram = detect_vram_gb()
-    gpu = detect_gpu_name()
-    if cfg is None:
-        try:
-            cfg = RecastConfig.from_yaml(resolve_config_path(settings.config_file()))
-        except Exception:
-            cfg = None
-    models = status_report(cfg)
+    heavy = _heavy_snapshot(settings, cfg)
+    vram = heavy["vram_gb"]
+    gpu = heavy["gpu_name"]
+    ffm = heavy["ffmpeg"]
+    mods = heavy["modules"]
+    models = heavy["models"]
     missing_models = [m["label"] for m in models if not m["present"] and m["key"] in {"inswapper_128"}]
     # inswapper absence is not fatal until replace; engine title uses 模型缺失 only when
     # a required runtime piece (ffmpeg / torch) is gone.
-    ffm = ffmpeg_status(settings.ffmpeg_dir)
-    mods = module_status()
     if running:
         state = ENG_RUNNING
     elif not ffm["ok"] or not mods.get("torch"):
@@ -162,8 +244,6 @@ def engine_snapshot(
         tier_label += "（当前卡看起来不是 16GB）"
     if vram is None and not gpu and settings.hardware_tier != "basic":
         tier_label += "（未检测到独显，建议改为基础档）"
-    from recast.generate.comfy import comfy_available
-    from recast.assets3d.drive import liveportrait_available
 
     return {
         "product": "本地再铸",
@@ -180,10 +260,12 @@ def engine_snapshot(
         "modules": mods,
         "models": models,
         "missing_optional": missing_models,
-        "disk_free_gb": disk_free_gb(settings.output_root or "."),
+        "disk_free_gb": heavy["disk_free_gb"],
         "cuda_ok": bool(mods.get("torch") and (vram is not None)),
-        "comfyui": {"url": getattr(settings, "comfyui_url", "") or "", "ok": comfy_available(getattr(settings, "comfyui_url", "") or None)},
-        "liveportrait": liveportrait_available(),
+        "comfyui": heavy["comfyui"],
+        "liveportrait": heavy["liveportrait"],
+        "scene": heavy["scene"],
+        "encode": heavy["encode"],
         "cloud_enabled": bool(getattr(settings, "cloud_enabled", False)),
         "auto_upload": bool(getattr(settings, "auto_upload", False)),
     }

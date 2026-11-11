@@ -10,7 +10,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from recast.ffmpeg import copy_sidecar_srt, run_ffmpeg
+from recast.ffmpeg import H264_SLOT, copy_sidecar_srt, run_concat, run_ffmpeg, run_h264
 from recast.templates.duration import check_shots, extend_timeline_for_audio
 
 log = logging.getLogger("recast")
@@ -45,34 +45,20 @@ def shots_to_segments(shots: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return segs
 
 
-def _concat_list(clips: list[Path], dest: Path) -> Path:
+def _concat_list(
+    clips: list[Path],
+    dest: Path,
+    *,
+    crf: int = 18,
+    use_nvenc: bool | None = None,
+) -> Path:
     lst = dest.parent / (dest.stem + "_concat.txt")
     lines = []
     for c in clips:
         s = str(c.resolve()).replace("'", "'\\''")
         lines.append(f"file '{s}'")
     lst.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    try:
-        run_ffmpeg(["-y", "-f", "concat", "-safe", "0", "-i", str(lst), "-c", "copy", str(dest)])
-    except Exception:
-        run_ffmpeg(
-            [
-                "-y",
-                "-f",
-                "concat",
-                "-safe",
-                "0",
-                "-i",
-                str(lst),
-                "-c:v",
-                "libx264",
-                "-pix_fmt",
-                "yuv420p",
-                "-an",
-                str(dest),
-            ]
-        )
-    return dest
+    return run_concat(lst, dest, crf=crf, use_nvenc=use_nvenc)
 
 
 def mix_filter_graph(delays_ms: list[int], total_duration: float) -> str:
@@ -129,6 +115,8 @@ def stitch_and_dub(
     burn_subs: bool = False,
     precheck_dialogue: bool = True,
     max_cps: float = 4.0,
+    crf: int = 18,
+    use_nvenc: bool | None = None,
 ) -> dict[str, Any]:
     """Stitch (if needed), mix dialogue/narration, write episode + sidecar SRT.
 
@@ -155,7 +143,7 @@ def stitch_and_dub(
             clips.append(Path(p))
     silent_path = Path(silent) if silent else workdir / "silent.mp4"
     if not silent_path.is_file() and clips:
-        _concat_list(clips, silent_path)
+        _concat_list(clips, silent_path, crf=crf, use_nvenc=use_nvenc)
     if not silent_path.is_file():
         raise FileNotFoundError("还没有静音画面，请先完成「按剧本生成（先静音）」。")
 
@@ -205,11 +193,27 @@ def stitch_and_dub(
         args = ["-y", "-i", str(silent_path)]
         if audio and Path(audio).is_file():
             args += ["-i", str(audio)]
-        args += ["-vf", filt, "-c:v", "libx264", "-pix_fmt", "yuv420p"]
+        args += ["-vf", filt, H264_SLOT]
         if audio and Path(audio).is_file():
             args += ["-c:a", "aac", "-shortest"]
         else:
             args += ["-an"]
+        args.append(str(output))
+        run_h264(args, crf=crf, use_nvenc=use_nvenc)
+        copy_sidecar_srt(srt, output)
+        marker = workdir / "DELIVERY.txt"
+        note = "成片与旁路 SRT 已写出。"
+        if (workdir / "ANIMATIC.txt").is_file():
+            note += " 画面是「分镜预览成片」，不是完整图生视频。"
+        marker.write_text(note + "\n", encoding="utf-8")
+        return {
+            "output": str(output),
+            "srt": str(srt),
+            "silent": str(silent_path),
+            "audio": str(audio) if audio and Path(audio).is_file() else None,
+            "segments": len(segs),
+            "confirmations": confirmations,
+        }
     args.append(str(output))
     run_ffmpeg(args)
     copy_sidecar_srt(srt, output)

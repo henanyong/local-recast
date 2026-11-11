@@ -56,6 +56,7 @@ def run(
                 burn_subs=False,
                 crf=cfg.compose.crf,
                 copy_audio=True,
+                use_nvenc=cfg.compose.use_nvenc,
             )
     else:
         mux_av(
@@ -66,6 +67,7 @@ def run(
             burn_subs=bool(burn and srt_in is not None),
             crf=cfg.compose.crf,
             copy_audio=True,
+            use_nvenc=cfg.compose.use_nvenc,
         )
 
     sidecar = None

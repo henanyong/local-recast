@@ -11,14 +11,20 @@ from recast.ffmpeg import VideoInfo, ensure_constant_frame_rate, extract_audio, 
 log = logging.getLogger("recast")
 
 
-def run(video: str | Path, workdir: Path) -> tuple[VideoInfo, Path | None]:
+def run(
+    video: str | Path,
+    workdir: Path,
+    *,
+    crf: int = 18,
+    use_nvenc: bool | None = None,
+) -> tuple[VideoInfo, Path | None]:
     workdir.mkdir(parents=True, exist_ok=True)
     info = probe_video(video)
     source = Path(video)
     if info.is_vfr:
         log.warning("检测到可变帧率（约 %.3f fps），先转成恒定帧率再继续。", info.fps)
         cfr = workdir / "source_cfr.mp4"
-        source = ensure_constant_frame_rate(video, cfr, info.fps)
+        source = ensure_constant_frame_rate(video, cfr, info.fps, crf=crf, use_nvenc=use_nvenc)
         info = probe_video(source)
     log.info(
         "视频 %sx%s  %.3f fps  %.2fs  %s 帧  编码=%s  音轨=%s",
