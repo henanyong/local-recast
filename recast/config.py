@@ -36,6 +36,10 @@ class WhisperConfig:
     device: str = "cuda"
     beam_size: int = 1
     vad_filter: bool = True
+    # Drop a segment when Whisper's no-speech probability is above this.
+    no_speech_prob: float = 0.6
+    # How far a word edge may move to meet a shot cut. Audio is never sped up.
+    edge_snap: float = 0.35
 
 
 @dataclass
