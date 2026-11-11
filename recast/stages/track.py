@@ -124,6 +124,11 @@ def run(
         "tracks": [tracks[i] for i in sorted(tracks)],
         "frames": frame_entries,
     }
+    payload = fill_track_gaps(
+        payload,
+        max_gap=int(getattr(cfg.detect, "max_gap_frames", 10) or 10),
+        fps=float(info.fps) if info.fps else None,
+    )
     out = workdir / "tracks_raw.json"
     # frames array can be large; still useful. Also write a compact track list.
     out.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -136,6 +141,70 @@ def run(
     held = model
     model = None
     release_cuda(held)
+    return payload
+
+
+def interpolate_track_frames(
+    frames: list[dict[str, Any]],
+    *,
+    max_gap: int = 10,
+    fps: float | None = None,
+) -> list[dict[str, Any]]:
+    """Linearly fill bbox holes of at most ``max_gap`` frames. Longer gaps stay open."""
+    if max_gap < 1 or len(frames) < 2:
+        return list(frames)
+    ordered = sorted(frames, key=lambda item: int(item.get("frame_idx") or 0))
+    filled: list[dict[str, Any]] = [dict(ordered[0])]
+    for nxt in ordered[1:]:
+        prev = filled[-1]
+        prev_idx = int(prev.get("frame_idx") or 0)
+        next_idx = int(nxt.get("frame_idx") or 0)
+        gap = next_idx - prev_idx - 1
+        prev_box = prev.get("bbox")
+        next_box = nxt.get("bbox")
+        if (
+            1 <= gap <= max_gap
+            and isinstance(prev_box, list)
+            and isinstance(next_box, list)
+            and len(prev_box) >= 4
+            and len(next_box) >= 4
+        ):
+            for step in range(1, gap + 1):
+                blend = step / (gap + 1)
+                bbox = [
+                    float(prev_box[k]) + (float(next_box[k]) - float(prev_box[k])) * blend
+                    for k in range(4)
+                ]
+                frame_idx = prev_idx + step
+                item: dict[str, Any] = {
+                    "frame_idx": frame_idx,
+                    "bbox": bbox,
+                    "conf": None,
+                    "interpolated": True,
+                }
+                if prev.get("time") is not None and nxt.get("time") is not None:
+                    item["time"] = float(prev["time"]) + (float(nxt["time"]) - float(prev["time"])) * blend
+                elif fps:
+                    item["time"] = frame_idx / float(fps)
+                filled.append(item)
+        filled.append(dict(nxt))
+    return filled
+
+
+def fill_track_gaps(
+    track_payload: dict[str, Any],
+    *,
+    max_gap: int = 10,
+    fps: float | None = None,
+) -> dict[str, Any]:
+    """Return a payload whose tracks have short detector gaps filled. Does not stitch different ids."""
+    payload = dict(track_payload)
+    tracks = []
+    for track in track_payload.get("tracks") or []:
+        row = dict(track)
+        row["frames"] = interpolate_track_frames(list(track.get("frames") or []), max_gap=max_gap, fps=fps)
+        tracks.append(row)
+    payload["tracks"] = tracks
     return payload
 
 

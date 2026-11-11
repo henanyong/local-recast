@@ -53,6 +53,80 @@ def _l2_normalize(vec: np.ndarray) -> np.ndarray:
     return vec / norm
 
 
+# Samples below these floors are blurry, tiny, or turned too far to represent the person.
+MIN_DET_SCORE = 0.35
+MIN_FACE_AREA = 20 * 20
+MIN_FRONTAL = 0.2
+CLUSTER_TOP_SAMPLES = 8
+
+
+def frontal_from_face(face: Any) -> float | None:
+    """1 is facing the camera. InsightFace pose is pitch, yaw, roll in degrees."""
+    pose = getattr(face, "pose", None)
+    if pose is None:
+        return None
+    try:
+        yaw = abs(float(list(pose)[1]))
+    except (TypeError, ValueError, IndexError):
+        return None
+    return max(0.0, 1.0 - yaw / 75.0)
+
+
+def sample_weight(det_score: float, area: float, frontal: float | None) -> float:
+    det = max(0.0, float(det_score))
+    size_term = min(1.0, (max(float(area), 0.0) ** 0.5) / 80.0)
+    front = 0.75 if frontal is None else max(0.0, min(1.0, float(frontal)))
+    return det * (0.35 + 0.65 * size_term) * (0.4 + 0.6 * front)
+
+
+def usable_sample(sample: dict[str, Any]) -> bool:
+    if float(sample.get("det_score") or 0.0) < MIN_DET_SCORE:
+        return False
+    if float(sample.get("area") or 0.0) < MIN_FACE_AREA:
+        return False
+    frontal = sample.get("frontal")
+    if frontal is not None and float(frontal) < MIN_FRONTAL:
+        return False
+    return True
+
+
+def quality_weighted_embedding(samples: list[dict[str, Any]]) -> tuple[np.ndarray | None, list[dict[str, Any]]]:
+    """Mean of the best samples, weighted by detection score, size, and frontal-ness."""
+    if not samples:
+        return None, []
+    kept = [s for s in samples if usable_sample(s) and s.get("emb") is not None]
+    if not kept:
+        best = max(samples, key=lambda s: float(s.get("det_score") or 0.0))
+        if best.get("emb") is None:
+            return None, []
+        kept = [best]
+    kept = sorted(kept, key=lambda s: float(s.get("weight") or 0.0), reverse=True)[:CLUSTER_TOP_SAMPLES]
+    weights = np.array([max(float(s.get("weight") or 0.0), 1e-6) for s in kept], dtype=np.float32)
+    matrix = np.stack([np.asarray(s["emb"], dtype=np.float32).reshape(-1) for s in kept])
+    mean = (matrix * weights[:, None]).sum(axis=0) / float(weights.sum())
+    return _l2_normalize(mean), kept
+
+
+def cluster_distance_and_confidence(
+    vectors: list[np.ndarray],
+    mean_det: float,
+    threshold: float,
+) -> tuple[float, float]:
+    """Mean pairwise cosine distance, and a 0..1 confidence for later review."""
+    if len(vectors) >= 2:
+        dists: list[float] = []
+        for i in range(len(vectors)):
+            for j in range(i + 1, len(vectors)):
+                dists.append(1.0 - float(np.dot(vectors[i], vectors[j])))
+        distance = float(sum(dists) / len(dists))
+    else:
+        distance = 0.0
+    span = max(float(threshold), 1e-6)
+    tight = 1.0 - min(1.0, max(0.0, distance) / span)
+    quality = min(1.0, max(0.0, float(mean_det)))
+    return distance, 0.5 * tight + 0.5 * quality
+
+
 def _providers(device: str) -> list[str]:
     if device == "cuda":
         return ["CUDAExecutionProvider", "CPUExecutionProvider"]
@@ -71,25 +145,16 @@ def build_face_app(model_name: str, det_size: int, device: str):
     return app
 
 
-def _associate(faces: list[Any], detections: list[dict[str, Any]]) -> list[tuple[int, Any]]:
-    """Greedy match of faces to person tracks in the same frame."""
-    used_faces: set[int] = set()
-    assigned: list[tuple[int, Any]] = []
-    for det in detections:
-        best_i, best_score = -1, 0.0
-        for i, face in enumerate(faces):
-            if i in used_faces:
-                continue
-            fb = [float(x) for x in face.bbox]
-            score = _iou(det["bbox"], fb)
-            if score < 0.05 and _contains(det["bbox"], fb):
-                score = max(score, 0.15)
-            if score > best_score:
-                best_i, best_score = i, score
-        if best_i >= 0 and best_score >= 0.05:
-            used_faces.add(best_i)
-            assigned.append((int(det["track_id"]), faces[best_i]))
-    return assigned
+def _associate(
+    faces: list[Any],
+    detections: list[dict[str, Any]],
+    *,
+    min_iou: float | None = None,
+) -> list[tuple[int, Any]]:
+    """Mutual best match of faces to person tracks. Same rule as L1 replace."""
+    from recast.stages.face_match import MIN_FACE_IOU, match_detections
+
+    return match_detections(faces, detections, min_iou=MIN_FACE_IOU if min_iou is None else min_iou)
 
 
 def _cluster_tracks(
@@ -149,7 +214,7 @@ def run(
 
     cap = open_capture(video)
 
-    embeddings: dict[int, list[np.ndarray]] = defaultdict(list)
+    records: dict[int, list[dict[str, Any]]] = defaultdict(list)
     samples_meta: dict[int, list[dict[str, Any]]] = defaultdict(list)
     wanted = set(frames_of_interest)
     last = max(wanted) if wanted else -1
@@ -163,26 +228,39 @@ def run(
         if frame_idx in frames_of_interest:
             dets = frames_of_interest[frame_idx]
             faces = app.get(frame) or []
-            for tid, face in _associate(faces, dets):
+            for tid, face in _associate(faces, dets, min_iou=float(cfg.identity.min_face_iou)):
                 emb = _l2_normalize(np.asarray(face.embedding, dtype=np.float32))
-                embeddings[tid].append(emb)
-                samples_meta[tid].append(
-                    {
-                        "frame_idx": frame_idx,
-                        "bbox": [float(x) for x in face.bbox],
-                        "det_score": float(getattr(face, "det_score", 0.0) or 0.0),
-                    }
-                )
+                bbox = [float(x) for x in face.bbox]
+                area = max(0.0, bbox[2] - bbox[0]) * max(0.0, bbox[3] - bbox[1])
+                det = float(getattr(face, "det_score", 0.0) or 0.0)
+                frontal = frontal_from_face(face)
+                weight = sample_weight(det, area, frontal)
+                meta = {
+                    "frame_idx": frame_idx,
+                    "bbox": bbox,
+                    "det_score": det,
+                    "area": area,
+                    "frontal": frontal,
+                    "weight": weight,
+                }
+                samples_meta[tid].append(meta)
+                records[tid].append({**meta, "emb": emb})
             pbar.update(1)
         frame_idx += 1
     pbar.close()
     cap.release()
 
     means: dict[int, np.ndarray] = {}
-    for tid, vecs in embeddings.items():
-        if not vecs:
+    mean_det: dict[int, float] = {}
+    for tid, samples in records.items():
+        mean, used = quality_weighted_embedding(samples)
+        if mean is None:
             continue
-        means[tid] = _l2_normalize(np.mean(np.stack(vecs, axis=0), axis=0))
+        means[tid] = mean
+        mean_det[tid] = float(sum(float(s.get("det_score") or 0.0) for s in used) / max(1, len(used)))
+        used_frames = {int(s["frame_idx"]) for s in used}
+        for meta in samples_meta.get(tid, []):
+            meta["used_for_cluster"] = int(meta["frame_idx"]) in used_frames
 
     cluster_of = _cluster_tracks(means, cfg.identity.cluster_threshold)
 
@@ -221,7 +299,21 @@ def run(
         vecs = [means[tid] for tid in member_ids if tid in means]
         embedding = None
         if vecs:
-            embedding = [float(x) for x in _l2_normalize(np.mean(np.stack(vecs, axis=0), axis=0))]
+            weights = np.array(
+                [max(mean_det.get(tid, 0.05), 0.05) for tid in member_ids if tid in means],
+                dtype=np.float32,
+            )
+            stacked = np.stack(vecs)
+            embedding = [
+                float(x)
+                for x in _l2_normalize((stacked * weights[:, None]).sum(axis=0) / float(weights.sum()))
+            ]
+        det_values = [mean_det[tid] for tid in member_ids if tid in mean_det]
+        distance, confidence = cluster_distance_and_confidence(
+            vecs,
+            sum(det_values) / len(det_values) if det_values else 0.0,
+            float(cfg.identity.cluster_threshold),
+        )
         persons.append(
             {
                 "name": name,
@@ -231,6 +323,8 @@ def run(
                 "face_samples": sum(len(samples_meta.get(tid, [])) for tid in member_ids),
                 "first_frame": cluster_first[cid],
                 "embedding": embedding,
+                "cluster_distance": distance,
+                "confidence": confidence,
             }
         )
 

@@ -41,6 +41,57 @@ def _save_crop(frame, bbox: list[float], dest: Path, pad: float = 0.25) -> Path 
     return dest
 
 
+def score_reference_sample(sample: dict[str, Any]) -> float:
+    """Higher is a better reference still: clear, large, and facing the camera."""
+    det = float(sample.get("det_score") or 0.0)
+    bbox = sample.get("bbox") or [0, 0, 0, 0]
+    try:
+        width = max(0.0, float(bbox[2]) - float(bbox[0]))
+        height = max(0.0, float(bbox[3]) - float(bbox[1]))
+    except (TypeError, ValueError, IndexError):
+        width, height = 0.0, 0.0
+    area = float(sample["area"]) if sample.get("area") else width * height
+    size_term = min(1.0, (max(area, 0.0) ** 0.5) / 120.0)
+    frontal = sample.get("frontal")
+    front = 0.75 if frontal is None else max(0.0, min(1.0, float(frontal)))
+    return det * (0.45 + 0.55 * size_term) * (0.4 + 0.6 * front)
+
+
+def select_reference_crops(
+    samples: list[dict[str, Any]],
+    *,
+    limit: int = 8,
+    min_frame_gap: int = 8,
+) -> list[dict[str, Any]]:
+    """Top samples by quality, spread across time instead of the first frames."""
+    if limit <= 0:
+        return []
+    ranked = sorted(samples, key=score_reference_sample, reverse=True)
+    best = score_reference_sample(ranked[0]) if ranked else 0.0
+    floor = best * 0.45
+    chosen: list[dict[str, Any]] = []
+    deferred: list[dict[str, Any]] = []
+    for sample in ranked:
+        if len(chosen) >= limit:
+            break
+        score = score_reference_sample(sample)
+        frame = int(sample.get("frame_idx") or 0)
+        if best > 0 and score < floor:
+            continue
+        if any(abs(frame - int(other.get("frame_idx") or 0)) < min_frame_gap for other in chosen):
+            deferred.append(sample)
+            continue
+        chosen.append(sample)
+    for sample in deferred:
+        if len(chosen) >= limit:
+            break
+        if best > 0 and score_reference_sample(sample) < floor:
+            continue
+        chosen.append(sample)
+    chosen.sort(key=lambda sample: int(sample.get("frame_idx") or 0))
+    return chosen[:limit]
+
+
 def export_face_crops(
     video: str | Path,
     workdir: Path,
@@ -49,18 +100,18 @@ def export_face_crops(
     *,
     max_per_person: int = 8,
 ) -> dict[str, list[str]]:
-    """Write face crops under workdir/face_samples/<auto_name>/ for the library UI."""
+    """Write the best face crops under workdir/face_samples/<auto_name>/."""
     tracks = {int(t["track_id"]): t for t in (track_payload.get("tracks") or [])}
     wanted: dict[int, list[dict[str, Any]]] = {}
-    person_of_track: dict[int, dict[str, Any]] = {}
     for person in ident.get("persons") or []:
+        candidates: list[dict[str, Any]] = []
         for tid in person.get("track_ids") or []:
-            person_of_track[int(tid)] = person
-            samples = (tracks.get(int(tid)) or {}).get("face_samples") or []
-            for sample in samples:
-                wanted.setdefault(int(sample["frame_idx"]), []).append(
-                    {"tid": int(tid), "bbox": sample["bbox"], "person": person}
-                )
+            for sample in (tracks.get(int(tid)) or {}).get("face_samples") or []:
+                candidates.append({**sample, "tid": int(tid), "person": person})
+        for sample in select_reference_crops(candidates, limit=max_per_person):
+            wanted.setdefault(int(sample["frame_idx"]), []).append(
+                {"tid": int(sample["tid"]), "bbox": sample["bbox"], "person": sample["person"]}
+            )
 
     dest_root = workdir / "face_samples"
     dest_root.mkdir(parents=True, exist_ok=True)

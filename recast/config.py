@@ -45,6 +45,8 @@ class DetectConfig:
     conf: float = 0.4
     iou: float = 0.5
     tracker: str = "bytetrack.yaml"
+    # Fill missing boxes across gaps no longer than this. Longer holes stay empty.
+    max_gap_frames: int = 10
 
 
 @dataclass
@@ -54,6 +56,8 @@ class IdentityConfig:
     cluster_threshold: float = 0.45
     max_faces_per_track: int = 24
     sample_every: int = 5
+    # Face must clear this IoU against the head zone before it is bound to a track.
+    min_face_iou: float = 0.2
 
 
 @dataclass
