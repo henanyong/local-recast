@@ -15,10 +15,11 @@ def run(
     cfg: RecastConfig,
     *,
     language: str | None = None,
+    names: Any = None,
 ) -> tuple[Path | None, Path | None, list[dict[str, Any]]]:
     from recast.stages import subtitles
 
-    srt_path, json_path, segments = subtitles.run(audio_wav, workdir, cfg, language=language)
+    srt_path, json_path, segments = subtitles.run(audio_wav, workdir, cfg, language=language, names=names)
     # Also keep a clearly named ASR copy so OCR/ASR dual tracks are obvious.
     if srt_path and Path(srt_path).is_file():
         dest = workdir / "asr.srt"

@@ -75,6 +75,29 @@ def _concat_list(clips: list[Path], dest: Path) -> Path:
     return dest
 
 
+def mix_filter_graph(delays_ms: list[int], total_duration: float) -> str:
+    """Mix dialogue clips without the default 1/N amix attenuation, then loudnorm.
+
+    ffmpeg amix defaults to normalize=1, which divides each input by the number
+    of clips. Audio is never time-stretched.
+    """
+    filters: list[str] = []
+    for i, delay in enumerate(delays_ms):
+        delay = max(0, int(delay))
+        filters.append(
+            f"[{i}:a]adelay={delay}|{delay},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=mono[a{i}]"
+        )
+    mix_ins = "".join(f"[a{i}]" for i in range(len(delays_ms)))
+    # loudnorm runs on the summed mix, before the tail pad, so silence does not
+    # pull the dialogue level back down.
+    filters.append(
+        f"{mix_ins}amix=inputs={len(delays_ms)}:duration=longest:dropout_transition=0:normalize=0,"
+        f"loudnorm=I=-16:TP=-1.5:LRA=11,"
+        f"apad=whole_dur={total_duration:.3f}[aout]"
+    )
+    return ";".join(filters)
+
+
 def _mix_audio(shots: list[dict[str, Any]], dest: Path, total_duration: float) -> Path | None:
     """Lay each wav at the shot start time. No atempo / speed change."""
     items: list[tuple[float, Path]] = []
@@ -86,16 +109,13 @@ def _mix_audio(shots: list[dict[str, Any]], dest: Path, total_duration: float) -
         items.append((start, Path(path)))
     if not items:
         return None
-    # Build an amix filter with adelay (ms)
     args: list[str] = ["-y"]
-    filters = []
-    for i, (start, path) in enumerate(items):
+    delays: list[int] = []
+    for start, path in items:
         args += ["-i", str(path)]
-        delay = max(0, int(round(start * 1000)))
-        filters.append(f"[{i}:a]adelay={delay}|{delay},aformat=sample_fmts=fltp:sample_rates=24000:channel_layouts=mono[a{i}]")
-    mix_ins = "".join(f"[a{i}]" for i in range(len(items)))
-    filters.append(f"{mix_ins}amix=inputs={len(items)}:duration=longest:dropout_transition=0,apad=whole_dur={total_duration:.3f}[aout]")
-    args += ["-filter_complex", ";".join(filters), "-map", "[aout]", "-t", f"{total_duration:.3f}", str(dest)]
+        delays.append(max(0, int(round(start * 1000))))
+    graph = mix_filter_graph(delays, total_duration)
+    args += ["-filter_complex", graph, "-map", "[aout]", "-t", f"{total_duration:.3f}", str(dest)]
     run_ffmpeg(args)
     return dest
 
