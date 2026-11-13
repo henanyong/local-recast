@@ -119,11 +119,16 @@ def assign_pose_detections(
     return assigned
 
 
-def mediapipe_pose_kwargs() -> dict[str, Any]:
-    """Video mode: MediaPipe tracks landmarks across frames instead of restarting each still."""
+def mediapipe_pose_kwargs(model_complexity: int = 0) -> dict[str, Any]:
+    """Video mode: MediaPipe tracks landmarks across frames instead of restarting each still.
+
+    ``model_complexity`` 0 is the lite model (repo default, fast); 1 is the full
+    model — measurably better on profile/standing shots (pilot: mean visibility
+    0.72-0.74 vs 0.62-0.65), at roughly 2x CPU cost. The rerender pilot uses 1.
+    """
     return {
         "static_image_mode": False,
-        "model_complexity": 0,
+        "model_complexity": int(model_complexity),
         "enable_segmentation": False,
         "min_detection_confidence": 0.4,
         "min_tracking_confidence": 0.4,
@@ -185,7 +190,7 @@ class KeypointSmoother:
                 out.append(dict(kp))
                 continue
             item = dict(kp)
-            for axis in ("x", "y", "z"):
+            for axis in ("x", "y", "z", "wx", "wy"):
                 raw = kp.get(axis)
                 if raw is None:
                     continue
@@ -330,16 +335,17 @@ class MediaPipeEstimator:
     name = "mediapipe"
     keypoint_format = "coco_17_from_mediapipe33"
 
-    def __init__(self) -> None:
+    def __init__(self, model_complexity: int = 0) -> None:
         import mediapipe as mp
 
         self._mp = mp
+        self._model_complexity = int(model_complexity)
         self._poses: dict[str, Any] = {}
 
     def _pose_for(self, key: str) -> Any:
         pose = self._poses.get(key)
         if pose is None:
-            pose = self._mp.solutions.pose.Pose(**mediapipe_pose_kwargs())
+            pose = self._mp.solutions.pose.Pose(**mediapipe_pose_kwargs(self._model_complexity))
             self._poses[key] = pose
         return pose
 
@@ -368,18 +374,30 @@ class MediaPipeEstimator:
             for src_idx in MP_TO_COCO:
                 lm = lms[src_idx]
                 z = None
+                wx = None
+                wy = None
                 if world is not None:
                     z = float(world[src_idx].z)
+                    # Metric 3D position, hips-centred (metres). The rerender
+                    # retarget needs full 3D, not just pixel x/y + world z:
+                    # pixel x/y carry the camera framing, world x/y carry the
+                    # body geometry. Kept as extra keys; other stages ignore
+                    # them. World axes: +x image-right, +y up, +z AWAY from
+                    # the camera (smaller z = closer), origin at hips centre.
+                    wx = float(world[src_idx].x)
+                    wy = float(world[src_idx].y)
                 else:
                     z = float(lm.z)
-                person.append(
-                    _kpt(
-                        ox + float(lm.x) * cw,
-                        oy + float(lm.y) * ch,
-                        float(lm.visibility or 0.0),
-                        z=z,
-                    )
+                item = _kpt(
+                    ox + float(lm.x) * cw,
+                    oy + float(lm.y) * ch,
+                    float(lm.visibility or 0.0),
+                    z=z,
                 )
+                if wx is not None:
+                    item["wx"] = wx
+                    item["wy"] = wy
+                person.append(item)
             out.append(person)
         return out
 

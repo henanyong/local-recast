@@ -105,6 +105,42 @@ def test_delete_l2_removes_files_and_row_keeps_face(tmp_path: Path):
     assert asset_flags(svc.store.get_character(ch["id"]))["3d"] in {"已齐", "偏低"}
 
 
+def test_delete_l2_partial_failure_keeps_row_and_reports(tmp_path: Path, monkeypatch):
+    svc = _service(tmp_path)
+    photo = _face(tmp_path / "face.jpg")
+    ch = _authorize(svc, "温念", photo)
+    asset = svc.build_l2(ch["id"], [str(photo)])
+    asset_dir = Path(asset["dir"])
+    files = sorted(p for p in asset_dir.rglob("*") if p.is_file())
+    assert files
+    locked = files[0]
+
+    real_unlink = Path.unlink
+
+    def _flaky(self, missing_ok=False):
+        if self.resolve() == locked.resolve():
+            raise PermissionError("文件被占用")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _flaky)
+    result = svc.delete_l2(ch["id"])
+    assert result["partial"] is True
+    assert result["status"] == "部分删除"
+    assert len(result["failed"]) == 1
+    assert result["failed"][0]["path"] == str(asset_dir)
+    assert result["failed"][0]["reason"] == "文件被占用"
+    assert locked.is_file()
+    saved = svc.store.get_character(ch["id"])
+    assert any(row.get("kind") in {"3d", "3d_avatar"} for row in saved["assets"])
+    assert photo.is_file()
+
+    monkeypatch.undo()
+    result = svc.delete_l2(ch["id"])
+    assert result["partial"] is False
+    assert result["status"] == "缺失"
+    assert not asset_dir.exists()
+
+
 def test_delete_l2_refuses_paths_outside_l2_tree(tmp_path: Path):
     svc = _service(tmp_path)
     photo = _face(tmp_path / "face.jpg")
@@ -138,7 +174,12 @@ def test_delete_l2_refuses_paths_outside_l2_tree(tmp_path: Path):
     (link_target / "secret.bin").write_text("keep", encoding="utf-8")
     link = output / "l2" / "escape"
     link.parent.mkdir(parents=True, exist_ok=True)
-    link.symlink_to(link_target, target_is_directory=True)
+    try:
+        link.symlink_to(link_target, target_is_directory=True)
+    except OSError:
+        # Windows without admin rights or Developer Mode cannot create
+        # symlinks (WinError 1314): skip instead of failing the suite.
+        pytest.skip("创建符号链接需要管理员权限或 Windows 开发者模式，跳过。")
     svc.store.set_character_asset(ch["id"], "3d", str(link / "asset.json"), complete=True)
     with pytest.raises(PermissionError, match="拒绝删除"):
         svc.delete_l2(ch["id"])
@@ -242,3 +283,43 @@ def test_bind_path_rejects_path_segments():
         bind_path_for("../models", "/tmp/outputs")
     with pytest.raises(L2PathError):
         bind_path_for("a/b", "/tmp/outputs")
+
+
+# ----- 资料完整度 must agree with the folder, not only with the index -----
+
+
+def test_asset_flags_reads_the_folder_when_the_db_has_no_rows(tmp_path):
+    """A character imported by copying its folder has files but no asset rows.
+
+    The panel used to print "脸：缺失" while showing the face photo one column
+    over. Every pipeline stage reads the folder, so the folder decides.
+    """
+    from recast.core.characters import character_folder
+
+    svc = _service(tmp_path)
+    ch = svc.store.insert(
+        "characters", name="林知夏", display_name="林知夏", confirmed=1, cluster_key="c:1"
+    )
+    folder = character_folder(svc.settings.output_root, "林知夏")
+    for sub in ("face", "costume", "voice"):
+        (folder / sub).mkdir(parents=True, exist_ok=True)
+    _face(folder / "face" / "01.png")
+    _face(folder / "costume" / "01.png")
+
+    row = svc.store.get_character(ch["id"])
+    on_disk = asset_flags(row, output_root=svc.settings.output_root)
+    assert on_disk["face"] == "已齐"
+    assert on_disk["costume"] == "已齐"
+    assert on_disk["voice"] == "缺失", "没有样本就应当仍报缺失"
+
+    db_only = asset_flags(row)
+    assert db_only["face"] == "缺失", "不传 output_root 时保持原来的索引语义"
+
+
+def test_asset_flags_prefers_a_real_row_path(tmp_path):
+    svc = _service(tmp_path)
+    photo = _face(tmp_path / "p.png")
+    ch = svc.add_character_manual("温念", str(photo))
+    row = svc.store.get_character(ch["id"])
+    # The row points at a real file, so the answer is 已齐 either way.
+    assert asset_flags(row, output_root=svc.settings.output_root)["face"] == "已齐"

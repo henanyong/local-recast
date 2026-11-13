@@ -228,10 +228,70 @@ class InswapperBackend:
             if source is None:
                 continue
             try:
-                out = self._swapper.get(out, faces[face_i], source, paste_back=True)
+                out = self._swap_and_paste(out, faces[face_i], source)
             except Exception as exc:
                 log.debug("单帧替换失败: %s", exc)
         return out
+
+    def _swap_and_paste(self, frame: np.ndarray, face: Any, source: Any) -> np.ndarray:
+        """Swap, then paste back with a feathered mask and a skin-tone match.
+
+        insightface's ``paste_back=True`` pastes the 128px fake into the frame
+        through its own mask. On a 250px face in a bright backlit shot that
+        leaves a visible rectangle: the source face is lighter than the target,
+        so the mask boundary shows as a patch. Two cheap additions remove it —
+        shift the fake's Lab mean onto the original face's, and blur the mask a
+        little more — which is the difference between "swapped" and "broken".
+        """
+        import cv2
+
+        result = self._swapper.get(frame, face, source, paste_back=False)
+        # insightface returns ``(aligned_fake, affine_matrix)`` here; some builds
+        # return just the image. Accept both rather than assuming a version.
+        if isinstance(result, tuple):
+            fake, matrix = result[0], result[1]
+        else:
+            fake, matrix = result, None
+        if fake is None or getattr(fake, "ndim", 0) != 3:
+            return frame
+        raw_size = getattr(self._swapper, "input_size", 128)
+        size = int(raw_size[0]) if isinstance(raw_size, (tuple, list)) else int(raw_size or 128)
+        kps = getattr(face, "kps", None)
+        if kps is None:
+            return self._swapper.get(frame, face, source, paste_back=True)
+        h, w = frame.shape[:2]
+        if matrix is None:
+            from insightface.utils import face_align
+
+            matrix = face_align.estimate_norm(kps, size)
+        inverse = cv2.invertAffineTransform(np.asarray(matrix, dtype=np.float64))
+        warped = cv2.warpAffine(
+            fake, inverse, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE
+        )
+
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, [cv2.convexHull(kps.astype(np.int32))], 255)
+        # Grow a little past the landmarks so the jaw line is covered, then
+        # soften: a hard hull edge is exactly what reads as a pasted patch.
+        mask = cv2.dilate(mask, np.ones((11, 11), np.uint8))
+        mask = cv2.GaussianBlur(mask, (0, 0), sigmaX=max(6.0, size * 0.08))
+        alpha = (mask.astype(np.float32) / 255.0)[:, :, None]
+
+        core = mask > 200
+        if int(core.sum()) > 200:
+            src_lab = cv2.cvtColor(warped, cv2.COLOR_BGR2LAB).astype(np.float32)
+            dst_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+            for channel in range(3):
+                src_mean = float(src_lab[:, :, channel][core].mean())
+                dst_mean = float(dst_lab[:, :, channel][core].mean())
+                # Lightness tracks the scene light, colour tracks the actor;
+                # match both but only partially on L so the swap keeps shape.
+                weight = 0.75 if channel == 0 else 0.9
+                src_lab[:, :, channel] += (dst_mean - src_mean) * weight
+            warped = cv2.cvtColor(np.clip(src_lab, 0, 255).astype(np.uint8), cv2.COLOR_LAB2BGR)
+
+        blended = frame.astype(np.float32) * (1.0 - alpha) + warped.astype(np.float32) * alpha
+        return np.clip(blended, 0, 255).astype(np.uint8)
 
     def unload(self) -> None:
         app, swapper, face = self._app, self._swapper, self._source_face
@@ -415,6 +475,65 @@ class SwapTemporalSmoother:
         return out
 
 
+def _plan_persons(identity: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """Persons the replace plan matches against.
+
+    identity.json v2 carries ``global_persons`` (GPID persons from the
+    cross-shot stitcher); when present they are the identity source of
+    truth, because one GPID already spans the tracklets that used to be
+    separate clusters. Old payloads only have ``persons`` and behave as
+    before.
+    """
+    if not identity:
+        return []
+    gp = identity.get("global_persons") or []
+    if gp:
+        return list(gp)
+    return list(identity.get("persons") or [])
+
+
+def _all_persons(identity: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """global_persons first, then persons — for lookups that must see both."""
+    if not identity:
+        return []
+    return list(identity.get("global_persons") or []) + list(identity.get("persons") or [])
+
+
+def _id_matches(raw: Any, wanted: Any) -> bool:
+    if raw is None or wanted is None:
+        return False
+    try:
+        return int(raw) == int(wanted)
+    except (TypeError, ValueError):
+        return str(raw) == str(wanted)
+
+
+def _find_person(identity: dict[str, Any] | None, person_id: int | str) -> dict[str, Any] | None:
+    """Find a person by gpid first, then by cluster_id.
+
+    global_persons are searched before persons, and within each list a
+    ``gpid`` match wins over a ``cluster_id`` match (a GPID person carries
+    both, with cluster_id == gpid).
+    """
+    persons = _all_persons(identity)
+    for key in ("gpid", "cluster_id"):
+        for person in persons:
+            if _id_matches(person.get(key), person_id):
+                return person
+    return None
+
+
+def _person_track_ids(person: dict[str, Any]) -> list[int]:
+    ids: list[int] = []
+    seen: set[int] = set()
+    for tid in (person.get("track_ids") or person.get("tracklet_ids") or []):
+        tid = int(tid)
+        if tid not in seen:
+            seen.add(tid)
+            ids.append(tid)
+    return ids
+
+
 def track_embedding_map(identity: dict[str, Any] | None) -> dict[int, list[float]]:
     out: dict[int, list[float]] = {}
 
@@ -431,7 +550,7 @@ def track_embedding_map(identity: dict[str, Any] | None) -> dict[int, list[float
                 continue
 
     _take((identity or {}).get("track_embeddings"))
-    for person in (identity or {}).get("persons") or []:
+    for person in _all_persons(identity):
         _take(person.get("track_embeddings"))
     return out
 
@@ -475,18 +594,24 @@ def split_tracks_by_identity(
 
 
 def match_similarity(identity: dict[str, Any] | None, override: float | None = None) -> float:
-    """Minimum cosine similarity for a confident reference-to-cluster match."""
+    """Minimum cosine similarity for a confident reference-to-cluster match.
+
+    Priority: explicit override, then ``min_similarity`` recorded in the
+    identity payload, then the default. ``cluster_threshold`` is deliberately
+    not consulted here: it belongs to clustering, and coupling the two meant
+    tuning clustering also moved the swap gate.
+    """
     if override is not None:
         return float(override)
-    raw = (identity or {}).get("cluster_threshold")
+    raw = (identity or {}).get("min_similarity")
     if raw is None:
         return DEFAULT_MATCH_SIMILARITY
     try:
-        dist = float(raw)
+        value = float(raw)
     except (TypeError, ValueError):
         return DEFAULT_MATCH_SIMILARITY
-    if 0.0 < dist < 1.0:
-        return 1.0 - dist
+    if 0.0 < value < 1.0:
+        return value
     return DEFAULT_MATCH_SIMILARITY
 
 
@@ -504,7 +629,7 @@ def _known_track_ids(track_payload: dict[str, Any] | None, identity: dict[str, A
 
     for track in (track_payload or {}).get("tracks") or []:
         _add(track.get("track_id"))
-    for person in (identity or {}).get("persons") or []:
+    for person in _all_persons(identity):
         for tid in person.get("track_ids") or []:
             _add(tid)
     return ordered
@@ -516,18 +641,14 @@ def _tracks_in_cluster(
     cluster_id: int,
 ) -> list[int]:
     if identity:
-        for person in identity.get("persons") or []:
+        # GPID persons first (their cluster_id == gpid), then old cluster
+        # persons; the track-payload fallback below is unchanged.
+        for person in _all_persons(identity):
             if person.get("cluster_id") is None:
                 continue
             if int(person["cluster_id"]) != int(cluster_id):
                 continue
-            ids: list[int] = []
-            seen: set[int] = set()
-            for tid in person.get("track_ids") or []:
-                tid = int(tid)
-                if tid not in seen:
-                    seen.add(tid)
-                    ids.append(tid)
+            ids = _person_track_ids(person)
             if ids:
                 return ids
     ids = []
@@ -550,17 +671,45 @@ def select_target_tracks(
     *,
     cluster_id: int | None = None,
     identity: dict[str, Any] | None = None,
+    person_id: int | str | None = None,
 ) -> list[int]:
     """Tracks to swap for one person.
 
     A cluster contributes every track id that belongs to it. An explicit
     ``track_id`` narrows that one person to the given track when the track is
     part of the cluster. There is no longest-track fallback.
+
+    ``person_id`` selects a person directly by GPID (preferred) or
+    cluster_id: global_persons are searched before persons. It wins over
+    ``cluster_id`` when both are given, and an unknown ``person_id`` raises
+    instead of silently swapping someone else.
     """
     known = _known_track_ids(track_payload, identity)
     known_set = set(known)
     if not known_set:
         raise RuntimeError("没有可用于替换的人物轨迹。")
+
+    if person_id is not None:
+        person = _find_person(identity, person_id)
+        if person is None:
+            available = []
+            for p in _all_persons(identity):
+                for key in ("gpid", "cluster_id"):
+                    if p.get(key) is not None and p.get(key) not in available:
+                        available.append(p.get(key))
+            raise RuntimeError(
+                f"找不到 person-id={person_id}。可用: {available}"
+            )
+        ids = _person_track_ids(person)
+        if known_set:
+            present = [i for i in ids if i in known_set]
+            if present:
+                ids = present
+        if not ids:
+            raise RuntimeError(f"人物 {person_id} 没有可替换的轨迹。")
+        if track_id is not None and int(track_id) in set(ids):
+            return [int(track_id)]
+        return ids
 
     if cluster_id is None:
         if track_id is None:
@@ -596,7 +745,7 @@ def _owns_track(person: dict[str, Any], track_id: int | None) -> bool:
 def _owner_name(identity: dict[str, Any] | None, track_id: int | None) -> str | None:
     if track_id is None or not identity:
         return None
-    for person in identity.get("persons") or []:
+    for person in _all_persons(identity):
         if _owns_track(person, track_id):
             return _person_name(person)
     return None
@@ -635,14 +784,14 @@ def plan_replace_targets(
             raise RuntimeError(f"找不到 track-id={track_id}。可用: {sorted(known)}")
 
     persons = []
-    for person in identity.get("persons") or []:
+    for person in _plan_persons(identity):
         emb = as_embedding(person.get("embedding"))
-        tracks = [int(t) for t in (person.get("track_ids") or [])]
+        tracks = _person_track_ids(person)
         if emb is None or not tracks:
             continue
         persons.append({**person, "embedding": emb, "track_ids": tracks})
 
-    any_embedding = any(as_embedding(p.get("embedding")) for p in (identity.get("persons") or []))
+    any_embedding = any(as_embedding(p.get("embedding")) for p in _plan_persons(identity))
     skipped: list[dict[str, Any]] = []
     scored: list[list[tuple[float, int]]] = []
     handled: set[int] = set()
@@ -738,6 +887,7 @@ def plan_replace_targets(
         targets.append(
             {
                 **_ref_brief(ref),
+                "gpid": int(person["gpid"]) if person.get("gpid") is not None else cluster_id,
                 "cluster_id": cluster_id,
                 "person_name": _person_name(person),
                 "track_ids": kept,
@@ -851,7 +1001,7 @@ def _load_identity(workdir: Path, track_payload: dict[str, Any], identity: dict[
 
 
 def _fill_cluster_embeddings(backend: InswapperBackend, identity: dict[str, Any], workdir: Path) -> None:
-    persons = list(identity.get("persons") or [])
+    persons = list(_plan_persons(identity))
     if not persons or all(as_embedding(p.get("embedding")) for p in persons):
         return
     samples: dict[str, list[str]] = {}
@@ -881,6 +1031,7 @@ def _public_plan(plan: dict[str, Any]) -> dict[str, Any]:
             "character_id": row.get("character_id"),
             "name": row.get("name"),
             "face_path": row.get("face_path"),
+            "gpid": row.get("gpid"),
             "cluster_id": row.get("cluster_id"),
             "person_name": row.get("person_name"),
             "track_ids": list(row.get("track_ids") or []),

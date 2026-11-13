@@ -46,11 +46,11 @@ REGISTRY: list[ModelSpec] = [
         notes="由 ultralytics 在首次检测时自动下载。",
     ),
     ModelSpec(
-        key="buffalo_s",
-        label="InsightFace buffalo_s",
+        key="buffalo_l",
+        label="InsightFace buffalo_l",
         kind="face",
         required_for=("library", "replace"),
-        notes="首次运行下载到用户目录 .insightface/models/ 。",
+        notes="首次运行下载到用户目录 .insightface/models/（约 326MB）。",
     ),
     ModelSpec(
         key="inswapper_128",

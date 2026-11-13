@@ -11,8 +11,41 @@ from recast.config import RecastConfig
 from recast.core.constants import AUTH_LICENSED, AUTH_OWN_SHOOT
 from recast.core.runner import resolve_swap_references, run_episode
 from recast.core.service import RecastService
-from recast.stages.replace import index_swap_frames, plan_replace_targets, select_target_tracks
+from recast.stages.replace import index_swap_frames, match_similarity, plan_replace_targets, select_target_tracks
 from recast.store.db import Store
+
+
+def test_match_similarity_is_independent_of_cluster_threshold():
+    # cluster_threshold 只管聚类：改它不应该动换脸的匹配门槛。
+    assert match_similarity({"cluster_threshold": 0.2}) == 0.55
+    assert match_similarity({"cluster_threshold": 0.6}) == 0.55
+    assert match_similarity({"cluster_threshold": 0.45}) == 0.55
+    # identity 里带的 min_similarity 生效，显式 override 优先。
+    assert match_similarity({"cluster_threshold": 0.2, "min_similarity": 0.7}) == 0.7
+    assert match_similarity({"min_similarity": 0.7}, override=0.6) == 0.6
+    assert match_similarity(None) == 0.55
+    assert match_similarity({"min_similarity": "bad"}) == 0.55
+
+
+def test_plan_threshold_follows_min_similarity_not_cluster_threshold():
+    # 参考脸与聚类的相似度 0.6：min_similarity 0.55 时通过，0.7 时拒绝；
+    # cluster_threshold 怎么变都不影响这个判断。
+    identity = {
+        "cluster_threshold": 0.45,
+        "min_similarity": 0.55,
+        "persons": [
+            {"name": "温念", "cluster_id": 1, "track_ids": [3], "embedding": [1.0, 0.0, 0.0]},
+        ],
+    }
+    ref = [{"character_id": "wen", "name": "温念", "face_path": "wen.jpg", "embedding": [0.6, 0.8, 0.0]}]
+    kept = plan_replace_targets(ref, identity, _tracks())
+    assert [t["name"] for t in kept["targets"]] == ["温念"]
+    for threshold in (0.2, 0.6):
+        changed = {**identity, "cluster_threshold": threshold}
+        assert plan_replace_targets(ref, changed, _tracks())["targets"]
+    strict = {**identity, "min_similarity": 0.7}
+    assert plan_replace_targets(ref, strict, _tracks())["targets"] == []
+    assert RecastConfig.from_yaml(Path("configs/4060ti-8g.yaml")).replace.min_similarity == 0.55
 
 
 def _identity() -> dict:

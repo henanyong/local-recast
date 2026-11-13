@@ -25,8 +25,90 @@ log = logging.getLogger("recast")
 
 ProgressFn = Callable[[str, str, float], None]
 
+#: Signature of the pre-compose lip-sync decision callback. Receives the
+#: warnings from ``check_lipsync_warnings`` and returns True to compose
+#: anyway, False to go back and edit the lines. Tests pass a fake;
+#: the desktop passes ``ask_lipsync_on_gui_thread`` (see
+#: ``recast/desktop/lipsync_warn_dialog.py``), which marshals the dialog
+#: onto the GUI thread because jobs run on worker threads.
+LipSyncConfirmFn = Callable[[list], bool]
+
 # Stages that run_episode itself implements.
 RUNNER_STAGES = ("scan", "extract", "library", "pose", "replace", "compose")
+
+
+def _load_dialogue_lines(workdir: Path) -> list[dict[str, Any]]:
+    """Dialogue lines for the lip-sync gate, or [] when there is nothing to check.
+
+    Only ``dialogue.json`` is read (the step-⑤ redub writes it with
+    ``audio_duration`` per line). Unlike
+    ``recast.generate.dialogue.load_dialogue`` this never builds a file
+    from ``shots_plan.json`` and never raises: a missing or unreadable
+    file means "no dubbed lines to check", not a reason to block compose.
+    """
+    path = Path(workdir) / "dialogue.json"
+    if not path.is_file():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8") or "[]")
+    except (ValueError, OSError) as exc:
+        log.warning("唇同步检查读不懂对白文件 %s（跳过检查）: %s", path, exc)
+        return []
+    if not isinstance(data, list):
+        log.warning("唇同步检查：对白文件 %s 不是列表（跳过检查）。", path)
+        return []
+    return [dict(line) for line in data if isinstance(line, dict)]
+
+
+def gate_compose_on_lipsync(
+    workdir: str | Path,
+    *,
+    lipsync_confirm: LipSyncConfirmFn | None = None,
+    tolerance_sec: float | None = None,
+) -> list[dict[str, Any]]:
+    """Pre-compose lip-sync gate (design 4.3①): warn, don't fix.
+
+    Checks the dubbed lines in ``<workdir>/dialogue.json``: any line whose
+    real audio duration outruns its shot slot by more than the tolerance
+    is a warning (see ``recast.quality.review.check_lipsync_warnings``
+    for the threshold rule). Returns the warnings as plain dicts (empty
+    when nothing is over).
+
+    * No ``dialogue.json`` / no dubbed lines / nothing over → returns []
+      and never asks anything: the import path without a redub has no
+      per-line dub audio to judge, and the video's own audio needs no
+      lip-sync check.
+    * Warnings + ``lipsync_confirm is None`` (headless / CLI / queue-panel
+      retry) → logs the warnings and returns them: compose proceeds and
+      the caller records them in the summary. No dialog is ever exec'd
+      from a worker thread without a GUI callback.
+    * Warnings + callback returns True → returns the warnings; the caller
+      composes and records them in the summary.
+    * Warnings + callback returns False → raises ``CancelledError`` so the
+      scheduler puts the task back to pending with its products kept:
+      the user goes back to step ⑤ to edit the lines. Nothing is
+      composed and no summary is written for this run.
+
+    This is a duration check only, not mouth-shape alignment: true
+    lip-sync (逐帧口型对齐) is explicitly out of scope for this gate.
+    """
+    from recast.quality.review import LIPSYNC_TOLERANCE_SEC, check_lipsync_warnings
+
+    tol = LIPSYNC_TOLERANCE_SEC if tolerance_sec is None else tolerance_sec
+    lines = _load_dialogue_lines(Path(workdir))
+    warnings = check_lipsync_warnings(lines, tolerance_sec=tol)
+    if not warnings:
+        return []
+    joined = "；".join(w.message for w in warnings)
+    log.warning("合成前唇同步警告（%s 行配音超出镜头）: %s", len(warnings), joined)
+    if lipsync_confirm is None:
+        return [w.as_dict() for w in warnings]
+    if lipsync_confirm(warnings):
+        return [w.as_dict() for w in warnings]
+    raise CancelledError(
+        f"已取消合成：{len(warnings)} 行配音超出镜头（{joined}）。"
+        "请先回第 ⑤ 步改短台词或拆分，再重新合成。"
+    )
 
 
 def select_compose_picture(
@@ -163,7 +245,9 @@ def _same_face(rows: list[dict[str, Any]], face_path: str) -> bool:
     return False
 
 
-def _character_reference(store: Store, character_id: str, *, require_auth: bool) -> dict[str, Any]:
+def _character_reference(
+    store: Store, character_id: str, *, require_auth: bool, output_root: str | Path | None = None
+) -> dict[str, Any]:
     ch = store.get_character(character_id)
     if not ch:
         raise RuntimeError(f"找不到人物: {character_id}")
@@ -172,6 +256,12 @@ def _character_reference(store: Store, character_id: str, *, require_auth: bool)
         raise PermissionError(
             "人物替换仅能用于已勾选授权的角色（自有拍摄 / 已授权 / 自有生成角色）。"
         )
+    if output_root is not None:
+        from recast.core.character_assets import resolve_face_reference
+
+        row = resolve_face_reference(output_root, character_id, store=store)
+        if row is not None:
+            return row
     row = _reference_from_character(ch)
     if row is None:
         label = ch.get("display_name") or ch.get("name") or character_id
@@ -224,12 +314,17 @@ def resolve_swap_references(
     character_ids: list[str] | None = None,
     face: str | Path | None = None,
     require_auth: bool = False,
+    output_root: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     """Authorized reference faces for one replace pass.
 
     An explicit character id is checked and included. When none is given and a
     store is available, every authorized character that has a reference face is
     included. A raw face file is only added when authorization allows it.
+
+    When ``output_root`` is given, a character folder's face/ wins over the
+    store's old face asset; without a usable folder the old lookup runs
+    unchanged.
     """
     explicit: list[str] = []
     seen: set[str] = set()
@@ -245,16 +340,22 @@ def resolve_swap_references(
     if store is not None and explicit:
         for cid in explicit:
             try:
-                rows.append(_character_reference(store, cid, require_auth=require_auth))
+                rows.append(_character_reference(store, cid, require_auth=require_auth, output_root=output_root))
             except RuntimeError:
                 # A single requested id with no file can still fall through to --face.
                 if not (len(explicit) == 1 and face and Path(face).is_file()):
                     raise
     elif store is not None and not face:
+        from recast.core.character_assets import resolve_face_reference
+
         for ch in store.list_characters():
             if not (ch.get("authorized") and ch.get("auth_type")):
                 continue
-            row = _reference_from_character(ch)
+            row = None
+            if output_root is not None:
+                row = resolve_face_reference(output_root, str(ch.get("id") or ""), store=store)
+            if row is None:
+                row = _reference_from_character(ch)
             if row is not None:
                 rows.append(row)
 
@@ -299,6 +400,141 @@ def resolve_swap_face(
     return Path(rows[0]["face_path"])
 
 
+def cover_options_for_compose(cover_mode: str | None) -> tuple[bool | None, str]:
+    """Translate ComposeConfig.cover_mode into compose.run arguments.
+
+    "off" (never cover) becomes ``cover_burned_subs=False``; every other
+    value keeps auto-detection (``cover_burned_subs=None``) and passes the
+    mode through, so compose.run still validates it (unknown mode raises
+    ValueError there). Empty / missing values fall back to "blur".
+    """
+    mode = (cover_mode or "blur").strip()
+    if mode == "off":
+        return False, "blur"
+    return None, mode or "blur"
+
+
+# Per-shot enhance flags live in the task workdir, not in the shots table
+# (the table has no enhance column): workdir/shots_enhance.json, only the
+# shots switched ON, {shot_code: true}. Written by
+# RecastService.set_shot_enhance; read here so compose can apply the
+# filter. Keep the filename in sync with service.py.
+SHOT_ENHANCE_FILENAME = "shots_enhance.json"
+
+
+def load_shot_enhance_flags(workdir: str | Path) -> dict[str, bool]:
+    """Read the per-shot enhance flags for a task workdir ({} when absent)."""
+    path = Path(workdir) / SHOT_ENHANCE_FILENAME
+    data = _load_json(path) or {}
+    if not isinstance(data, dict):
+        return {}
+    return {str(k): True for k, v in data.items() if v}
+
+
+def _shot_time_range(sh: dict[str, Any]) -> tuple[float, float] | None:
+    """Usable (start, end) for one shot, or None.
+
+    Script shots sometimes carry only ``narration_start`` /
+    ``narration_end`` (the store drops those columns in
+    ``replace_shots``), so fall back to them when ``start_time`` /
+    ``end_time`` are absent.
+    """
+    try:
+        start = sh.get("start_time")
+        if start is None:
+            start = sh.get("narration_start")
+        end = sh.get("end_time")
+        if end is None:
+            end = sh.get("narration_end")
+        start_f, end_f = float(start), float(end)
+    except (TypeError, ValueError):
+        return None
+    if end_f > start_f >= 0:
+        return start_f, end_f
+    return None
+
+
+def _shots_from_plan_file(workdir: Path) -> list[dict[str, Any]]:
+    """Shot rows from the script path's plan file (or shots.json).
+
+    The script path writes ``shots_plan.json`` (a list, or
+    ``{"shots": [...]}``); the import path writes ``shots.json``.
+    Either is a fallback when the store has no shots for the task.
+    """
+    for name in ("shots_plan.json", "shots.json"):
+        path = Path(workdir) / name
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+        if isinstance(data, dict):
+            rows = data.get("shots") or []
+        elif isinstance(data, list):
+            rows = data
+        else:
+            rows = []
+        if isinstance(rows, list):
+            return [dict(r) for r in rows if isinstance(r, dict)]
+    return []
+
+
+def enhance_shots_for_task(
+    store: Store | None,
+    task_id: str | None,
+    workdir: str | Path,
+) -> list[dict[str, Any]]:
+    """Time ranges of the shots whose enhance switch is ON.
+
+    Shot codes come from the store (``shots_for_task``); when the store has
+    no shots for the task, ``shots_plan.json`` / ``shots.json`` in the
+    workdir is the fallback. The flags file
+    (``workdir/shots_enhance.json``) is the source of truth — it is not
+    limited to shots the review queue flagged, so a clean shot can be
+    switched on too (N24): any shot code present in the store or the
+    plan file can be flagged via ``RecastService.set_shot_enhance``,
+    or by writing the flags file directly. Shots with no usable
+    start/end are skipped. Default: all off -> [].
+    """
+    flags = load_shot_enhance_flags(workdir)
+    if not flags:
+        return []
+    # Merge every shot source into one code -> time-range map: store
+    # rows first, plan-file rows fill in codes / times the store lacks
+    # (e.g. narration-only times the store never persisted).
+    ranges: dict[str, tuple[float, float]] = {}
+    shots: list[dict[str, Any]] = []
+    if store is not None and task_id:
+        try:
+            shots = store.shots_for_task(task_id)
+        except Exception:
+            shots = []
+    for sh in shots:
+        code = str(sh.get("shot_code") or "")
+        if not code:
+            continue
+        found = _shot_time_range(sh)
+        if found is not None:
+            ranges[code] = found
+        else:
+            ranges.setdefault(code, None)  # type: ignore[assignment]
+    for sh in _shots_from_plan_file(Path(workdir)):
+        code = str(sh.get("shot_code") or "")
+        if not code:
+            continue
+        found = _shot_time_range(sh)
+        if found is not None and ranges.get(code) is None:
+            ranges[code] = found
+    out: list[dict[str, Any]] = []
+    for code, span in ranges.items():
+        if not flags.get(code) or span is None:
+            continue
+        start, end = span
+        out.append({"shot_code": code, "start": start, "end": end})
+    return out
+
+
 def run_episode(
     video: str | Path,
     *,
@@ -321,6 +557,8 @@ def run_episode(
     progress: ProgressFn | None = None,
     output: str | Path | None = None,
     force_rerun: bool = False,
+    output_root: str | Path | None = None,
+    lipsync_confirm: LipSyncConfirmFn | None = None,
 ) -> dict[str, Any]:
     """Run one episode with per-step checkpoints and CUDA cache clears."""
     src = Path(video).expanduser().resolve()
@@ -554,11 +792,27 @@ def run_episode(
             ident = _load_json(ident_path) or {}
             # still try to ingest existing samples into the library
             if store is not None:
+                from recast.core.merge import resolve_output_root
                 from recast.extract.faces import ingest_into_library
 
                 index_path = run_dir / "face_samples" / "index.json"
                 samples = (_load_json(index_path) or {}) if index_path.is_file() else {}
-                ingest_into_library(store, ident, samples, task_id=task_id, drama_key=drama_key)
+                # B1: a cached identity.json carries GPID persons — ingest
+                # groups by GPID, falling back to cluster persons on old
+                # payloads (same rule as faces.run_library); output_root
+                # lets body/costume features persist into folder meta.json.
+                gpid_persons = (ident or {}).get("global_persons")
+                gpid_ident = (
+                    {**ident, "persons": list(gpid_persons)} if gpid_persons else ident
+                )
+                ingest_into_library(
+                    store,
+                    gpid_ident,
+                    samples,
+                    task_id=task_id,
+                    drama_key=drama_key,
+                    output_root=resolve_output_root(store),
+                )
         summary["persons"] = (ident or {}).get("persons")
         summary["tracks"] = len((load_track_payload(run_dir) or {}).get("tracks") or [])
         vram_report("人物库后")
@@ -593,6 +847,7 @@ def run_episode(
             character_ids=character_ids,
             face=face,
             require_auth=require_auth,
+            output_root=output_root,
         )
         if not swap_refs:
             raise RuntimeError(
@@ -626,6 +881,7 @@ def run_episode(
                 cfg,
                 references=swap_refs,
                 track_id=track_id,
+                min_similarity=cfg.replace.min_similarity,
             )
             remember("replace", replace_inputs, [Path(replaced_path)])
             release_cuda()
@@ -652,8 +908,22 @@ def run_episode(
         )
         if not maybe_skip("compose", [Path(picture), src], [output_path]):
             check_cancel()
+            # 4.3① 合成前唇同步拦截：dialogue.json 里有超长的配音行时，
+            # 先问用户（回调返回 False 即取消合成，抛 CancelledError 回到
+            # 待处理）；没回调时只记警告不拦路。警告进 summary，见下。
+            lipsync_warnings = gate_compose_on_lipsync(
+                run_dir, lipsync_confirm=lipsync_confirm
+            )
             from recast.stages import compose
 
+            # Cover mode default comes from ComposeConfig (yaml preset or the
+            # settings-dialog override); auto-detect stays on unless "off".
+            cover_burned_subs, cover_mode = cover_options_for_compose(
+                getattr(cfg.compose, "cover_mode", "blur")
+            )
+            # Per-shot enhance: only the shots switched ON in
+            # workdir/shots_enhance.json are filtered (default: none).
+            enhance_shots = enhance_shots_for_task(store, task_id, run_dir)
             final = compose.run(
                 picture,
                 src if src.is_file() else video_alias,
@@ -663,6 +933,9 @@ def run_episode(
                 subtitle=srt if srt.is_file() else None,
                 burn_subs=burn_subs,
                 has_audio=bool(info.has_audio) if info is not None else None,
+                cover_burned_subs=cover_burned_subs,
+                cover_mode=cover_mode,
+                enhance_shots=enhance_shots,
             )
             archived = run_dir / "output.mp4"
             if Path(final).resolve() != archived.resolve():
@@ -673,6 +946,10 @@ def run_episode(
                     pass
             remember("compose", [Path(picture), src], [Path(final)])
             summary["output"] = str(final)
+            if lipsync_warnings:
+                # 用户已知情继续合成：把超长的行与超出量留在任务 summary 里，
+                # 终检/任务历史能看到是哪几句盖住了下一镜。
+                summary["lipsync_warnings"] = lipsync_warnings
         else:
             summary["output"] = str(output_path if output_path.is_file() else run_dir / "output.mp4")
         mark("compose", f"成片已写出: {summary.get('output')}", 1.0)
@@ -718,11 +995,17 @@ def _run_export_stages(
     audio: Path | None = None,
     srt: Path | None = None,
     title: str = "本地再铸导出",
+    entry_type: str = "import",
     settings=None,
     progress: ProgressFn | None = None,
 ) -> dict[str, Any]:
     from recast.compose.cost import write_cost_xlsx
-    from recast.compose.jianying import export_jianying_draft
+    from recast.compose.jianying import (
+        JianyingDraftError,
+        export_jianying_draft,
+        validate_for_jianying,
+        verify_jianying_draft,
+    )
     from recast.core.timing import timed_run
 
     result: dict[str, Any] = {}
@@ -741,16 +1024,51 @@ def _run_export_stages(
                 rec["message"] = str(exc)
                 rec["status"] = "ok"
                 xlsx = dest_root / "cost.csv"
-            jy = export_jianying_draft(
-                dest_root / "jianying_draft",
+            # 先校验再建稿：不过就抛 JianyingDraftError（中文原因），一个文件
+            # 也不写；校验不过的异常绝不吞掉，交给调度器记为任务失败原因。
+            jy_dest = dest_root / "jianying_draft"
+            srt_path = srt or (
+                workdir / "subtitles.srt"
+                if (workdir / "subtitles.srt").is_file()
+                else None
+            )
+            # 台词表只在生成路线校验：台词就是字幕源头；再铸路线传了会因
+            # 来源不同误报对不齐。台词表在分集工作目录的 dialogue.json。
+            dialogue_path = (
+                workdir / "dialogue.json"
+                if entry_type == "script" and (workdir / "dialogue.json").is_file()
+                else None
+            )
+            report = validate_for_jianying(
+                jy_dest,
                 shots=shots or [],
                 output_video=output,
                 silent_video=silent,
                 audio=audio,
-                srt=srt or (workdir / "subtitles.srt" if (workdir / "subtitles.srt").is_file() else None),
+                srt=srt_path,
+                dialogue=dialogue_path,
                 title=title,
             )
+            if not report.ok:
+                raise JianyingDraftError(report.errors)
+            jy = export_jianying_draft(
+                jy_dest,
+                shots=shots or [],
+                output_video=output,
+                silent_video=silent,
+                audio=audio,
+                srt=srt_path,
+                title=title,
+                output_root=getattr(settings, "output_root", None),
+                store=store,
+            )
+            # 写完再自检一次：草稿文件齐不齐、链接断没断。
+            check = verify_jianying_draft(jy)
+            if not check.ok:
+                raise JianyingDraftError(check.errors)
             rec["message"] = f"成本表 {xlsx}；剪映草稿 {jy}（未打开剪映验证；同目录有 EDL 与 FCP XML）"
+            if check.warnings:
+                rec["message"] += f"；提醒：{'；'.join(check.warnings)}"
             result["cost_xlsx"] = str(xlsx)
             result["jianying"] = str(jy)
             _progress(progress, "export", rec["message"], 1.0)
@@ -807,11 +1125,18 @@ def dispatch_job(
     max_cps: float = 4.0,
     rerun_shot: str | None = None,
     settings=None,
+    lipsync_confirm: LipSyncConfirmFn | None = None,
 ) -> dict[str, Any]:
     """Run either the import-video path or the generate-from-script path."""
     wanted = normalize_stages(list(stages or []) + (["pose"] if with_pose else []))
     workdir = Path(workdir)
     workdir.mkdir(parents=True, exist_ok=True)
+    if lipsync_confirm is None:
+        # GUI 回调不走 Job/服务层参数（本批文件边界只到 runner）：主窗口
+        # 在开始前把它挂在共用的 settings 对象上（见
+        # ``MainWindow._bind_lipsync_confirm``），这里用 getattr 读回。
+        # 显式参数优先；读不到时为 None，合成前只记警告不弹框。
+        lipsync_confirm = getattr(settings, "lipsync_confirm", None)
     summary: dict[str, Any] = {}
     if entry_type == "script" or (pack_root and (not video or not Path(video).is_file())):
         from recast.core.script_pipeline import run_script_episode
@@ -863,6 +1188,8 @@ def dispatch_job(
                     drama_key=drama_key,
                     progress=progress,
                     output=Path(output) if output else workdir / "output_replaced.mp4",
+                    output_root=getattr(settings, "output_root", None),
+                    lipsync_confirm=lipsync_confirm,
                 )
                 summary["replace"] = summary_rep
             except Exception as exc:
@@ -873,6 +1200,58 @@ def dispatch_job(
             shots = json.loads(plan.read_text(encoding="utf-8")).get("shots") if False else json.loads(plan.read_text(encoding="utf-8"))
             if isinstance(shots, dict):
                 shots = shots.get("shots") or []
+        # N24: script-path enhance. stitch_and_dub never reads
+        # shots_enhance.json, so without this the script path silently
+        # ignored every enhance flag. Apply the same time-range filter
+        # as a post-pass on the stitched output (see
+        # recast.stages.compose.enhance_script_output). Only when this
+        # call actually stitched (dub/compose in gen_stages) — an
+        # export-only rerun must not re-enhance an old output. The
+        # enhanced file replaces the output in place, so summary /
+        # store pointers stay valid. A failure here never fails the
+        # episode: the unenhanced cut is kept and the failure is
+        # recorded in summary["enhance_error"] instead of going silent.
+        # Flags are not limited to review-flagged shots: any shot in
+        # the plan can be switched on via RecastService.set_shot_enhance
+        # or by writing workdir/shots_enhance.json directly.
+        if "dub" in gen_stages or "compose" in gen_stages:
+            replace_summary = summary.get("replace") or {}
+            final_out = (
+                replace_summary.get("output")
+                if isinstance(replace_summary, dict)
+                else None
+            ) or summary.get("output")
+            final_path = Path(str(final_out)) if final_out else workdir / "output.mp4"
+            if final_path.is_file():
+                enhance_shots = enhance_shots_for_task(store, task_id, workdir)
+                if enhance_shots:
+                    from recast.stages.compose import enhance_script_output
+
+                    try:
+                        enhanced = enhance_script_output(
+                            final_path,
+                            workdir,
+                            enhance_shots,
+                            crf=int(getattr(getattr(config, "compose", None), "crf", 18) or 18),
+                            use_nvenc=getattr(getattr(config, "compose", None), "use_nvenc", None),
+                        )
+                        if Path(enhanced) != final_path:
+                            shutil.move(str(enhanced), str(final_path))
+                        summary["enhanced_shots"] = [s["shot_code"] for s in enhance_shots]
+                        summary["enhance_applied"] = True
+                        if store and task_id:
+                            try:
+                                store.update("tasks", task_id, output_file=str(final_path))
+                            except Exception:
+                                pass
+                        log.info(
+                            "剧本路逐镜头增强已应用（%s 个镜头）：%s",
+                            len(enhance_shots), final_path,
+                        )
+                    except Exception as exc:
+                        log.warning("剧本路逐镜头增强失败，保留未增强成片: %s", exc)
+                        summary["enhance_error"] = str(exc)
+                        summary["enhance_applied"] = False
         summary.update(
             _run_export_stages(
                 workdir=workdir,
@@ -886,6 +1265,7 @@ def dispatch_job(
                 audio=workdir / "dialogue_mix.wav" if (workdir / "dialogue_mix.wav").is_file() else None,
                 srt=workdir / "subtitles.srt" if (workdir / "subtitles.srt").is_file() else None,
                 title=Path(workdir).parent.name,
+                entry_type=entry_type,
                 settings=settings,
                 progress=progress,
             )
@@ -922,6 +1302,8 @@ def dispatch_job(
             drama_key=drama_key,
             progress=progress,
             output=output,
+            output_root=getattr(settings, "output_root", None),
+            lipsync_confirm=lipsync_confirm,
         )
     if "template" in wanted and pack_root:
         from recast.templates.pack import load_pack, pin_pack_for_task
@@ -952,7 +1334,12 @@ def dispatch_job(
         thumbs = work / "review_thumbs"
 
         def _embed(sample: dict) -> tuple[list[float], list[float]] | None:
-            return try_embed_sample(sample, replaced if replaced.is_file() else None)
+            identity_model = getattr(getattr(config, "identity", None), "model", None)
+            return try_embed_sample(
+                sample,
+                replaced if replaced.is_file() else None,
+                model=identity_model or "buffalo_l",
+            )
 
         items = post_replace_review_items(
             shots,
@@ -990,6 +1377,7 @@ def dispatch_job(
             output=out_path if out_path.is_file() else None,
             srt=Path(workdir) / "subtitles.srt" if (Path(workdir) / "subtitles.srt").is_file() else None,
             title=Path(video).stem if video else "本地再铸导出",
+            entry_type=entry_type,
             settings=settings,
             progress=progress,
         )

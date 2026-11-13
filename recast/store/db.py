@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS dramas (
     id TEXT PRIMARY KEY,
     origin_name TEXT NOT NULL,
     new_name TEXT,
-    root_path TEXT NOT NULL UNIQUE,
+    root_path TEXT NOT NULL,
+    source_path TEXT UNIQUE,
     episode_count INTEGER DEFAULT 0,
     status TEXT NOT NULL DEFAULT '待执行',
     progress TEXT,
@@ -62,6 +63,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     source_dialogue TEXT,
     source_storyboard TEXT,
     pack_snapshot TEXT,
+    selected_characters TEXT,
+    stage_list TEXT,
     FOREIGN KEY (drama_id) REFERENCES dramas(id) ON DELETE CASCADE
 );
 
@@ -209,10 +212,25 @@ CREATE TABLE IF NOT EXISTS quality_marks (
     thumbnail TEXT
 );
 
+CREATE TABLE IF NOT EXISTS auth_skips (
+    id TEXT PRIMARY KEY,
+    drama_id TEXT,
+    task_id TEXT,
+    character_name TEXT NOT NULL,
+    reason TEXT,
+    skipped_at TEXT,
+    created_at TEXT,
+    FOREIGN KEY (drama_id) REFERENCES dramas(id) ON DELETE CASCADE,
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS schema_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+
+CREATE INDEX IF NOT EXISTS idx_auth_skips_drama ON auth_skips(drama_id);
+CREATE INDEX IF NOT EXISTS idx_auth_skips_task ON auth_skips(task_id);
 
 CREATE INDEX IF NOT EXISTS idx_tasks_drama ON tasks(drama_id);
 CREATE INDEX IF NOT EXISTS idx_shots_task ON shots(task_id);
@@ -398,21 +416,80 @@ class Store:
 
     # ----- dramas / tasks -----
 
-    def upsert_drama_by_path(self, root_path: str, *, origin_name: str, episode_count: int) -> dict[str, Any]:
+    def find_drama_by_source(self, source_path: str) -> dict[str, Any] | None:
+        """Drama whose file identity is ``source_path`` (see N30)."""
+        cur = self.connect().execute("SELECT * FROM dramas WHERE source_path = ?", (source_path,))
+        return _row_to_dict(cur.fetchone())
+
+    def find_task_by_video(self, video_path: str) -> dict[str, Any] | None:
+        """Task row for one episode video (N39): any episode, not just the first.
+
+        ``video_path`` is stored as the resolved absolute path the scanner
+        produced, so callers must pass a resolved path too.
+        """
+        cur = self.connect().execute("SELECT * FROM tasks WHERE video_path = ?", (video_path,))
+        return _row_to_dict(cur.fetchone())
+
+    def find_drama_by_task_video(self, video_path: str) -> dict[str, Any] | None:
+        """Drama that already owns a task for ``video_path`` (N39).
+
+        This is the cross-drama lookup ``find_drama_by_source`` cannot do:
+        a drama's identity is its FIRST episode, so a non-first episode
+        only shows up here, via its task row. Returns None when no task
+        references the video.
+        """
+        cur = self.connect().execute(
+            "SELECT d.* FROM dramas d"
+            " JOIN tasks t ON t.drama_id = d.id"
+            " WHERE t.video_path = ? LIMIT 1",
+            (video_path,),
+        )
+        return _row_to_dict(cur.fetchone())
+
+    def find_drama_by_root(self, root_path: str) -> dict[str, Any] | None:
+        """Drama filed under ``root_path`` (legacy lookup, no uniqueness)."""
         cur = self.connect().execute("SELECT * FROM dramas WHERE root_path = ?", (root_path,))
-        row = _row_to_dict(cur.fetchone())
+        return _row_to_dict(cur.fetchone())
+
+    def upsert_drama_by_path(
+        self,
+        root_path: str,
+        *,
+        origin_name: str,
+        episode_count: int,
+        source_path: str | None = None,
+    ) -> dict[str, Any]:
+        """Insert or refresh a drama row, deduped by FILE identity (N30).
+
+        ``source_path`` is the identity: for an imported drama the first
+        episode's video file path, for a script drama its virtual folder.
+        Two videos in the same folder therefore get two drama rows, where
+        the old ``root_path UNIQUE`` merged them and the second import
+        silently replaced the first one's episode tasks. When
+        ``source_path`` is given, lookup is by that value ONLY — falling
+        back to ``root_path`` would reintroduce the merge. When it is
+        omitted (legacy callers), lookup falls back to ``root_path`` and
+        the identity is stored as ``root_path`` itself.
+        """
+        identity = source_path or root_path
+        row = self.find_drama_by_source(identity)
+        if row is None and source_path is None:
+            row = self.find_drama_by_root(root_path)
         if row:
             return self.update(
                 "dramas",
                 row["id"],
                 origin_name=origin_name,
                 episode_count=episode_count,
+                root_path=root_path,
+                source_path=identity,
             ) or row
         return self.insert(
             "dramas",
             origin_name=origin_name,
             new_name=origin_name,
             root_path=root_path,
+            source_path=identity,
             episode_count=episode_count,
             status=ST_PENDING,
             progress="等待执行",
@@ -467,6 +544,7 @@ class Store:
             con.execute("DELETE FROM subtitles WHERE task_id IN (SELECT id FROM tasks WHERE drama_id = ?)", (drama_id,))
             con.execute("DELETE FROM checkpoints WHERE task_id IN (SELECT id FROM tasks WHERE drama_id = ?)", (drama_id,))
             con.execute("DELETE FROM runs WHERE drama_id = ?", (drama_id,))
+            con.execute("DELETE FROM auth_skips WHERE drama_id = ?", (drama_id,))
             con.execute("DELETE FROM tasks WHERE drama_id = ?", (drama_id,))
             con.execute("DELETE FROM dramas WHERE id = ?", (drama_id,))
 
@@ -475,6 +553,264 @@ class Store:
         for d in rows:
             self.delete_drama(d["id"])
         return len(rows)
+
+    # ----- auth skips (N18, P3 schema bundle) -----
+
+    # ----- drama <-> character scope (N40, P4) -----
+    #
+    # 剧目→人物的映射只用库里现成的两处来源，不新增表、不改写旧行：
+    # 1. ``characters.source_task_id``——人物首次从哪个分集任务里提取
+    #    出来（extract/faces.py 写），经 tasks 表找到所属剧目；
+    # 2. ``tasks.selected_characters``——某次启动时该分集任务选中的
+    #    人物名快照（N11），名字落在哪个剧目的任务里就属哪个剧目。
+    # 两处都对不上的人物（手动添加、旧库行、改名后快照还是旧名）算
+    # “归属未知”，关口与读口都按“属于本剧”放行（fail-open）：宁可
+    # 多弹一次关口，也不让一个没链路的人物被静默跳过。反过来，只
+    # 有明确链到别的剧目的人物才会被收窄出去。
+    #
+    # 已知缺口：同一人物先在 B 剧出现、后又出现在 A 剧时，
+    # ``source_task_id`` 只保留首次提取的任务（upsert 不更新它），
+    # 且跨剧合并只认首次聚类——此时该人物仍只链 B，跑 A 时关口
+    # 不会弹他；要根治需在提取/合并时补记“出现过的全部任务”。
+
+    def _drama_ids_for_names(self, names: set[str]) -> dict[str, set[str]]:
+        """每个名字链到的剧目 id 集合（N40 映射，内部用）。
+
+        空集合 = 归属未知（两处来源都没有这名字），调用方按属于本剧
+        处理，绝不据此静默排除。读不到表时同样返回全空，不抛错。
+        """
+        found: dict[str, set[str]] = {n: set() for n in names}
+        if not names:
+            return found
+        try:
+            task_rows = self.list_rows("tasks")
+        except Exception:
+            return found
+        task_to_drama = {
+            t.get("id"): t.get("drama_id") for t in task_rows if t.get("id")
+        }
+        try:
+            char_rows = self.list_rows("characters")
+        except Exception:
+            char_rows = []
+        for ch in char_rows:
+            for key in (
+                (ch.get("display_name") or "").strip(),
+                (ch.get("name") or "").strip(),
+            ):
+                if key in found:
+                    did = task_to_drama.get((ch.get("source_task_id") or "").strip())
+                    if did:
+                        found[key].add(did)
+        for t in task_rows:
+            did = t.get("drama_id")
+            if not did:
+                continue
+            for n in _decode_name_list(t.get("selected_characters")):
+                if n in found:
+                    found[n].add(did)
+        return found
+
+    def _foreign_names(self, names: set[str], drama_id: str) -> set[str]:
+        """名字里明确链到别的剧目、且不链本剧的那些（N40 内部用）。"""
+        linked = self._drama_ids_for_names(set(names))
+        return {n for n in names if linked.get(n) and drama_id not in linked[n]}
+
+    def linked_drama_ids_for_character_name(self, name: str) -> set[str]:
+        """一个人名链到的剧目 id（N40）。
+
+        来源：同名人物行的 ``source_task_id`` 与各任务的
+        ``selected_characters`` 快照。空集合表示归属未知，不是“不
+        属于任何剧目”——调用方须按属于本剧放行。
+        """
+        name = (name or "").strip()
+        if not name:
+            return set()
+        return set(self._drama_ids_for_names({name}).get(name) or set())
+
+    def linked_drama_ids_for_character(self, character: dict[str, Any]) -> set[str]:
+        """一人物行链到的剧目 id（N40）。
+
+        除名字映射外，行自身的 ``source_task_id`` 是直接证据：改名
+        后快照里的旧名对不上新名时，仍靠它链到原剧目。
+        """
+        character = character or {}
+        names = {
+            (character.get("display_name") or "").strip(),
+            (character.get("name") or "").strip(),
+        } - {""}
+        out: set[str] = set()
+        for linked in self._drama_ids_for_names(names).values():
+            out |= linked
+        sid = (character.get("source_task_id") or "").strip()
+        if sid:
+            try:
+                row = self.get("tasks", sid)
+            except Exception:
+                row = None
+            if row and row.get("drama_id"):
+                out.add(row["drama_id"])
+        return out
+
+    def character_in_scope(
+        self, character_or_name: Any, drama_ids: list[str] | None = None
+    ) -> bool:
+        """人物（行或人名）是否属于所选剧目之一（N40）。
+
+        ``drama_ids`` 为空（None/[]）= 不收窄，全算在内；链不到任
+        何剧目（归属未知）= 算在内；只链到别的剧目 = 不在范围内。
+        读不到映射时同样放行，绝不因一次读失败拦住关口。
+        """
+        if not drama_ids:
+            return True
+        wanted = {str(d) for d in drama_ids if str(d).strip()}
+        if not wanted:
+            return True
+        try:
+            if isinstance(character_or_name, str):
+                linked = self.linked_drama_ids_for_character_name(character_or_name)
+            elif isinstance(character_or_name, dict):
+                linked = self.linked_drama_ids_for_character(character_or_name)
+            else:
+                return True
+        except Exception:
+            return True
+        return not linked or bool(linked & wanted)
+
+    def _auth_skip_scope_drama(
+        self, drama_id: str | None, task_id: str | None
+    ) -> str | None:
+        """读口的生效剧目：直接给的 drama_id 优先，否则由 task 反查。"""
+        if drama_id:
+            return drama_id
+        if task_id:
+            try:
+                row = self.get("tasks", task_id)
+            except Exception:
+                row = None
+            if row and row.get("drama_id"):
+                return row["drama_id"]
+        return None
+
+    def record_auth_skip(
+        self,
+        drama_id: str | None,
+        character_name: str,
+        *,
+        task_id: str | None = None,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Persist one auth-gate skip (N18).
+
+        This is the durable record the gate's ``progress``-text note is
+        not: the runner rewrites ``tasks.progress`` / ``dramas.progress``
+        as it runs, but it never touches ``auth_skips``, so a skipped
+        character stays findable after the run. Same
+        (drama, task, character) twice records once (the gate can be
+        re-confirmed for the same drama).
+        """
+        name = (character_name or "").strip()
+        if not name:
+            raise ValueError("跳过的人物名不能为空。")
+        existing = self.list_auth_skips(drama_id=drama_id, task_id=task_id)
+        for row in existing:
+            if (row.get("character_name") or "") == name:
+                return row
+        now = _now()
+        return self.insert(
+            "auth_skips",
+            drama_id=drama_id,
+            task_id=task_id,
+            character_name=name,
+            reason=reason,
+            skipped_at=now,
+            created_at=now,
+        )
+
+    def list_auth_skips(
+        self,
+        *,
+        drama_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Skipped characters, newest first. Tolerant: a database that
+        somehow has no ``auth_skips`` table yet reads as “none skipped”.
+
+        N40：查某个剧目时，已产生的假记录（人名明确链到别的剧目、
+        却记在本剧名下，P3 关口全局算的遗留）不删除——库里原行原
+        样返回，只在行上多挂一个 ``scope_note`` 字段：
+        ``"全局未授权，非本剧人物"``。任务历史查看器会把这句直接
+        显示出来。归属未知的人名（库里没链路）不挂标注。没给剧目
+        （也没给能反查剧目的 task）时无法判定，不标注。
+        """
+        try:
+            where, args = "", []
+            if drama_id is not None:
+                where, args = "drama_id = ?", [drama_id]
+            if task_id is not None:
+                where = f"{where} AND task_id = ?" if where else "task_id = ?"
+                args.append(task_id)
+            rows = self.list_rows("auth_skips", where, args, order="skipped_at DESC, character_name")
+        except sqlite3.OperationalError:
+            return []
+        eff = self._auth_skip_scope_drama(drama_id, task_id)
+        if eff:
+            try:
+                names = {
+                    (r.get("character_name") or "").strip()
+                    for r in rows
+                    if (r.get("character_name") or "").strip()
+                }
+                foreign = self._foreign_names(names, eff)
+                for r in rows:
+                    if (r.get("character_name") or "").strip() in foreign:
+                        r["scope_note"] = "全局未授权，非本剧人物"
+            except Exception:
+                pass
+        return rows
+
+    def skipped_character_names(
+        self,
+        *,
+        drama_id: str | None = None,
+        task_id: str | None = None,
+    ) -> list[str]:
+        """Distinct skipped character names, oldest first, in record order.
+
+        N40：查某个剧目时，只返回属于本剧（或归属未知）的人名；
+        明确链到别的剧目的假记录人名会被滤掉——但这只是读口的
+        过滤，库里原行还在，用 :meth:`list_auth_skips` 查同一剧
+        目仍能看到它（带 ``scope_note`` 标注）。没给剧目（也没给
+        能反查剧目的 task）时无法判定，不过滤。
+        """
+        try:
+            where, args = "", []
+            if drama_id is not None:
+                where, args = "drama_id = ?", [drama_id]
+            if task_id is not None:
+                where = f"{where} AND task_id = ?" if where else "task_id = ?"
+                args.append(task_id)
+            rows = self.list_rows("auth_skips", where, args, order="skipped_at ASC")
+        except sqlite3.OperationalError:
+            return []
+        eff = self._auth_skip_scope_drama(drama_id, task_id)
+        foreign: set[str] = set()
+        if eff:
+            try:
+                names = {
+                    (row.get("character_name") or "").strip()
+                    for row in rows
+                    if (row.get("character_name") or "").strip()
+                }
+                foreign = self._foreign_names(names, eff)
+            except Exception:
+                foreign = set()
+        names_out: list[str] = []
+        for row in rows:
+            name = (row.get("character_name") or "").strip()
+            if name and name not in names_out and name not in foreign:
+                names_out.append(name)
+        return names_out
 
     # ----- characters -----
 
@@ -714,6 +1050,29 @@ class Store:
         return self.list_rows("quality_marks", "task_id = ?", (task_id,), order="created_at")
 
 
+
+
+def _decode_name_list(value: Any) -> list[str]:
+    """Decode a stored character-name list (N40 映射用）。
+
+    ``Store`` 存 list 时是 JSON（见 ``_dump``），旧行/手写行可能
+    是 ``"、"`` / ``","`` / ``";"`` 分隔的纯文本；NULL/空串读作
+    空列表，绝不编造名字。
+    """
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    text = str(value).strip()
+    if not text:
+        return []
+    try:
+        data = json.loads(text)
+        if isinstance(data, list):
+            return [str(v).strip() for v in data if str(v).strip()]
+    except Exception:
+        pass
+    return [p.strip() for p in re.split(r"[、,，;；]", text) if p.strip()]
 
 
 def _dump(value: Any) -> Any:
