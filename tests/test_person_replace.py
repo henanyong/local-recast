@@ -148,7 +148,10 @@ def test_clip_writes_a_video_and_audits_every_frame(tmp_path):
     assert not any("比例估计" in note for note in result["notes"])
 
 
-def test_clip_warns_when_the_neck_line_is_a_guess(tmp_path):
+def test_clip_refuses_a_missing_neck_line_upfront(tmp_path):
+    """A guessed neck line (42% of frame height) wrecked whole clips: the
+    caller must now supply a measured one (estimate_neck_y), and the refusal
+    happens before any frame is processed."""
     import cv2
 
     clip = tmp_path / "in.mp4"
@@ -157,15 +160,29 @@ def test_clip_warns_when_the_neck_line_is_a_guess(tmp_path):
         writer.write(_frame())
     writer.release()
 
-    result = replace_clip(
-        clip,
-        tmp_path / "out.mp4",
-        character_folder=_character(tmp_path),
-        mask_fn=lambda frame, index: _mask(),
-        parts=("full",),
-        frame_limit=2,
-    )
-    assert any("比例估计" in note for note in result["notes"])
+    char = _character(tmp_path)
+    # Explicitly passing None gets the guidance message...
+    with pytest.raises(TypeError, match=r"neck_y_fn.*estimate_neck_y"):
+        replace_clip(
+            clip,
+            tmp_path / "out.mp4",
+            character_folder=char,
+            mask_fn=lambda frame, index: _mask(),
+            neck_y_fn=None,
+            parts=("full",),
+            frame_limit=2,
+        )
+    assert not (tmp_path / "out.mp4").exists()  # refused before any work
+    # ...and omitting it is a signature-level error.
+    with pytest.raises(TypeError, match="neck_y_fn"):
+        replace_clip(
+            clip,
+            tmp_path / "out.mp4",
+            character_folder=char,
+            mask_fn=lambda frame, index: _mask(),
+            parts=("full",),
+            frame_limit=2,
+        )
 
 
 def test_clip_refuses_to_invent_a_segmentation(tmp_path):

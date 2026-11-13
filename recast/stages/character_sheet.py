@@ -199,22 +199,39 @@ def _palette(bgr: Any, *, top_n: int = 5, mask: Any = None) -> list[dict[str, An
 
 
 def _person_mask(bgr: Any) -> Any:
-    """Person silhouette for palette counting, or None when no model is here.
+    """Person silhouette for palette counting, or None when no mask is here.
 
     A full-body portrait is mostly background (measured: 75% studio grey for
-    a green cardigan), so the palette is meaningless without this. Lazy
-    import on purpose: ``person_mask`` imports this module for face boxes.
+    a green cardigan), so the palette is meaningless without this. This goes
+    through the same ``segment_person_auto`` / ``pick_backend("auto")`` chain
+    as the rest of the pipeline: calling ``rmbg_foreground`` directly made the
+    palette silently fall back to full-photo statistics whenever the RMBG
+    weights were absent — background pixels passed off as the character's
+    palette. None is returned only when no backend produced a usable person
+    mask (and ``palette_source`` then honestly says ``full_photo``); a
+    rectangle-only GrabCut result ("box") counts as no mask, because a box
+    mixes the background inside it into the palette. Lazy import on purpose:
+    ``person_mask`` imports this module for face boxes.
     """
     try:
-        from recast.stages.person_mask import rmbg_foreground
+        from recast.stages.person_mask import segment_person_auto
 
-        alpha = rmbg_foreground(bgr)
-        mask = alpha > 0.5
-        if mask.sum() < 0.02 * mask.size:
-            return None
-        return mask
-    except Exception:
+        result = segment_person_auto(bgr, backend="auto")
+    except Exception as exc:
+        log.info("人物分割不可用，调色板如实回退全图统计: %s", exc)
         return None
+    if str(result.get("method") or "") == "box":
+        log.info(
+            "人物分割只给出矩形框（%s），调色板如实回退全图统计",
+            result.get("warning") or "",
+        )
+        return None
+    import numpy as np
+
+    mask = np.asarray(result["mask"]) > 0
+    if int(mask.sum()) < 0.02 * mask.size:
+        return None
+    return mask
 
 
 def _installed_face_pack() -> str | None:

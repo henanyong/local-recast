@@ -238,3 +238,77 @@ def test_palette_says_so_when_it_had_to_use_the_whole_photo(tmp_path, monkeypatc
     out = appearance_from_photos([photo])
     assert out["palette_source"] == "full_photo"
     assert {p["color"] for p in out["palette"]} == {"绿色", "白色"}
+
+
+# ----- _person_mask must go through the pipeline's segmentation chain -----
+
+
+def test_person_mask_goes_through_the_auto_backend_chain(tmp_path, monkeypatch):
+    """_person_mask must use segment_person_auto/pick_backend("auto") like the
+    rest of the pipeline — not a direct rmbg_foreground call that silently
+    degraded to full-photo statistics when the RMBG weights were missing."""
+    import cv2
+
+    import recast.stages.character_sheet as sheet
+    import recast.stages.person_mask as pm
+
+    photo = _half_green_photo(tmp_path / "face" / "01.png")
+    calls = {}
+
+    def fake_auto(bgr, *, backend="auto", **kwargs):
+        calls["backend"] = backend
+        calls["called"] = True
+        mask = np.zeros(np.asarray(bgr).shape[:2], dtype=np.uint8)
+        mask[:, :48] = 255  # the green half = the person
+        return {"mask": mask, "method": "yolo-seg", "warning": ""}
+
+    monkeypatch.setattr(pm, "segment_person_auto", fake_auto)
+    bgr = cv2.imdecode(np.fromfile(str(photo), dtype=np.uint8), cv2.IMREAD_COLOR)
+    mask = sheet._person_mask(bgr)
+    assert calls == {"backend": "auto", "called": True}
+    assert mask is not None and bool(mask[:, :48].all())
+
+    out = appearance_from_photos([photo])
+    assert out["palette_source"] == "person"
+    assert out["palette"][0]["color"] == "绿色"
+
+
+def test_person_mask_is_none_only_when_no_backend_runs(tmp_path, monkeypatch):
+    from recast.stages.person_mask import PersonMaskError
+
+    import recast.stages.character_sheet as sheet
+    import recast.stages.person_mask as pm
+
+    photo = _half_green_photo(tmp_path / "face" / "01.png")
+
+    def no_backend(bgr, *, backend="auto", **kwargs):
+        raise PersonMaskError("没有任何可用的分割后端")
+
+    monkeypatch.setattr(pm, "segment_person_auto", no_backend)
+    out = appearance_from_photos([photo])
+    assert out["palette_source"] == "full_photo"
+
+
+def test_person_mask_refuses_a_box_only_fallback(tmp_path, monkeypatch):
+    """A GrabCut rectangle is not a silhouette: counting it would mix the
+    background inside the box into the palette, so it counts as no mask."""
+    import cv2
+
+    import recast.stages.character_sheet as sheet
+    import recast.stages.person_mask as pm
+
+    photo = _half_green_photo(tmp_path / "face" / "01.png")
+
+    def box_only(bgr, *, backend="auto", **kwargs):
+        mask = np.full(np.asarray(bgr).shape[:2], 255, dtype=np.uint8)
+        return {
+            "mask": mask,
+            "method": "box",
+            "warning": "GrabCut 没分出轮廓，退回矩形框（边缘会是硬的）",
+        }
+
+    monkeypatch.setattr(pm, "segment_person_auto", box_only)
+    bgr = cv2.imdecode(np.fromfile(str(photo), dtype=np.uint8), cv2.IMREAD_COLOR)
+    assert sheet._person_mask(bgr) is None
+    out = appearance_from_photos([photo])
+    assert out["palette_source"] == "full_photo"

@@ -62,7 +62,7 @@ CHROMA_FULL = 14.0
 # (a+27, b+11) — within a few degrees), while a collar or a tie sits far off
 # it. So the guard ramps over hue angle instead of chroma magnitude.
 REL_HUE_FULL = 22.0  # degrees from the main hue: full recolour weight
-REL_HUE_ZERO = 65.0  # degrees: a genuinely different colour, zero weight
+REL_HUE_ZERO = 50.0  # degrees: a genuinely different colour, zero weight
 # Below this chroma the hue is pure noise (a white collar measures ~0), so
 # the pixel is protected regardless of angle; the ramp back to full weight is
 # ABS_NEUTRAL_RAMP wide. Knit shadows (chroma >= 5) clear it.
@@ -71,6 +71,36 @@ ABS_NEUTRAL_RAMP = 4.0
 # If the region's own main chroma is below this there is no hue to compare
 # against (grey suit, white shirt) and the old absolute ramp is used.
 NEUTRAL_MAIN_CHROMA = 4.0
+# A bright near-neutral pixel is a foreign white (collar, shirt highlight),
+# NOT garment shadow: a fold is always darker than the region's main
+# luminance, a collar is always lighter. Measured on the real frame: the
+# dyed-collar streak sat at chroma 2-5 / L 130-175 while the knit's main
+# luminance is ~55 — the L margin separates them cleanly. The chroma cap is
+# scaled by the main chroma so a low-chroma garment never protects its own
+# bright folds.
+NEUTRAL_CHROMA_MAX = 10.0
+NEUTRAL_L_MARGIN = 30.0
+# --- print exemption (connected components) ---------------------------------
+# A red flower printed on a cream blouse sits at the SAME hue as a wine
+# cardigan, so no per-pixel colour rule can spare it — and a neighbourhood
+# share test fails too: inside a dense print the protected pixels never reach
+# a majority. What identifies a print is structure, not share: the printed
+# flower is a SMALL connected blob of hue-aligned pixels surrounded by a low
+# -chroma / foreign-hue base, while the garment body is one huge blob (or
+# surrounded by its own shadow, which is hue-aligned and thus not "base").
+# So: find hue-aligned blobs, and exempt the small ones whose surrounding
+# ring reads as printed-fabric base.
+PRINT_BLOB_MAX_AREA = 20000   # px; real flowers measure 0.5-3k, the cardigan blob 100k+
+PRINT_SURROUND_PX = 21        # ring width around the blob
+PRINT_SURROUND_MIN = 0.30     # base share in the ring that triggers exemption
+# A ring pixel counts as "printed-fabric base" when it is either foreign-hued
+# (cream ~+40 deg off a wine main, blue flowers ~-100) or nearly neutral
+# (white ground). Foreign-but-saturated neighbours (another garment of a
+# different colour, chroma 60+) do NOT count: that is how a real cardigan
+# pressed against something else stays exempt.
+PRINT_FOREIGN_HUE_DEG = 30.0
+PRINT_BASE_MAG_MAX = 28.0
+PRINT_NEUTRAL_MAG = 4.0
 # --- skin guard -------------------------------------------------------------
 # skin_mask's YCrCb rule also matches mid-dark reds: a wine cardigan pixel
 # measured Y=83 / Cr=162 / Cb=126, comfortably inside the rule, so every such
@@ -79,6 +109,13 @@ NEUTRAL_MAIN_CHROMA = 4.0
 # misdetects sit below ~110. The skip therefore only fires on bright pixels;
 # dark "skin" is treated as garment (shadow) and recoloured.
 SKIN_SKIP_MIN_Y = 115.0
+# Shadowed skin escapes that Y gate too: the chest V under the chin measured
+# Y 90-125 with hue +29..+50 degrees, and got dyed pale green. Skin is always
+# WARMER than a red/wine main hue, so skin-flagged pixels inside this warm
+# band off the main hue are skipped as well — the garment misdetects sit ON
+# the main hue (offset ~0) and stay recoloured.
+SKIN_WARM_OFFSET_MIN = 20.0
+SKIN_WARM_OFFSET_MAX = 80.0
 # Auto garment pick: a colour cluster only counts as "the garment" if its own
 # chroma is above this. Measured on a grey blazer over a wine top: blazer
 # clusters sit at chroma 1.6 / 5.2 / 11.2, the top at 18.4 — 14 separates them
@@ -536,22 +573,55 @@ def transfer_garment(
 
 
 def _region_main_chroma(a: Any, b: Any, box_region: Any) -> tuple[float, float]:
-    """Median chroma offset of the region — the garment's own hue direction.
+    """The garment's own hue direction, as a chroma vector.
 
-    The median (not the mean) survives a floral print or a bright accent: a
-    minority cluster cannot drag the main colour off the garment body.
+    Component-wise medians fail on a multi-hue region: a 50/50 red/green body
+    has median (a+3, b+44) — a phantom hue matching NEITHER half, and the
+    guard then starves both. So the main colour is the *magnitude-weighted
+    peak of the hue histogram*: real garments are one coherent hue mass, so
+    the peak lands on the garment even with a print or skin in the region.
+    Near-neutral pixels (mag <= 2) carry no direction and are excluded; a
+    region too small or too neutral to have a peak falls back to the median.
     """
     import numpy as np
 
     if not bool(box_region.any()):
         return 0.0, 0.0
-    a_med = float(np.median(a[box_region])) - 128.0
-    b_med = float(np.median(b[box_region])) - 128.0
-    return a_med, b_med
+    va = (a - 128.0)[box_region]
+    vb = (b - 128.0)[box_region]
+    mag = np.sqrt(va * va + vb * vb)
+    keep = mag > 2.0
+    if int(keep.sum()) < 64:
+        # An almost-neutral region: no hue to peak on, keep the old median.
+        return float(np.median(va)), float(np.median(vb))
+    va, vb, mag = va[keep], vb[keep], mag[keep]
+    # The peak is a histogram mode: a bounded deterministic subsample gives
+    # the same peak at a fraction of the atan2/histogram cost (measured on a
+    # 1080x1920 torso: 46 ms -> 9 ms, peak within one bin).
+    stride = max(1, int(va.size) // 100000)
+    if stride > 1:
+        va, vb, mag = va[::stride], vb[::stride], mag[::stride]
+    ang = np.degrees(np.arctan2(vb, va))  # -180..180
+    bins = 144  # 2.5 degrees per bin: fine enough for the guard's ramp scale
+    hist, edges = np.histogram(ang, bins=bins, range=(-180.0, 180.0), weights=mag)
+    kernel = np.array([1.0, 2.0, 3.0, 2.0, 1.0])
+    kernel = kernel / kernel.sum()
+    wrapped = np.concatenate([hist[-2:], hist, hist[:2]])
+    smooth = np.convolve(wrapped, kernel, mode="same")[2:-2]
+    peak = float(edges[int(np.argmax(smooth))]) + (edges[1] - edges[0]) / 2.0
+    # The main vector is the mean chroma of the pixels around the peak, so it
+    # carries the peak family's own saturation, not a unit direction.
+    offset = (ang - peak + 180.0) % 360.0 - 180.0
+    sel = np.abs(offset) <= 30.0
+    return float(np.mean(va[sel])), float(np.mean(vb[sel]))
 
 
-def _relative_guard(a: Any, b: Any, main_da: float, main_db: float) -> Any:
-    """Per-pixel recolour weight in [0, 1] from hue alignment with the garment.
+_HUE_GUARD_LUT: Any = None
+_HUE_ANGLE_LUT: Any = None
+
+
+def _relative_guard(a: Any, b: Any, main_da: float, main_db: float) -> tuple[Any, Any]:
+    """Per-pixel recolour weight and signed hue offset, from the main colour.
 
     A pixel counts as garment body when its chroma vector points the same way
     as the region's main colour — at ANY magnitude, so shadows and highlights
@@ -559,23 +629,98 @@ def _relative_guard(a: Any, b: Any, main_da: float, main_db: float) -> Any:
     different hue) ramp to zero by ``REL_HUE_ZERO`` degrees. Chroma below
     ``ABS_NEUTRAL_FLOOR`` has no stable direction, so it is protected by an
     absolute ramp: that is what keeps a white collar white.
+
+    Returns ``(guard, off)`` where ``off`` is the pixel's signed hue offset
+    from the main hue in degrees (positive = warmer than the main hue). The
+    print-exemption pass needs it to tell a cream/white base from a garment
+    shadow without recomputing arctan2. The angle is read from a cosine
+    lookup table: arccos on a 1080x1920 torso costs ~15 ms per frame, the
+    LUT the same math in ~3 ms with < 0.3 degrees of error.
     """
     import numpy as np
 
+    global _HUE_GUARD_LUT, _HUE_ANGLE_LUT
     va = a - 128.0
     vb = b - 128.0
-    mag = np.hypot(va, vb)
-    main_mag = float(np.hypot(main_da, main_db))
+    mag = np.sqrt(va * va + vb * vb)
+    main_mag = float(np.sqrt(main_da * main_da + main_db * main_db))
     if main_mag < 1e-6:
-        return np.zeros(mag.shape, dtype=np.float32)
+        zeros = np.zeros(mag.shape, dtype=np.float32)
+        return zeros, zeros.copy()
     dot = va * main_da + vb * main_db
-    denom = np.maximum(mag * main_mag, 1e-6)
-    cosang = np.clip(dot / denom, -1.0, 1.0)
-    angle = np.degrees(np.arccos(cosang))
-    span = max(1e-6, REL_HUE_ZERO - REL_HUE_FULL)
-    hue_ramp = np.clip((REL_HUE_ZERO - angle) / span, 0.0, 1.0)
+    cosang = np.clip(dot / np.maximum(mag * main_mag, 1e-6), -1.0, 1.0)
+    if _HUE_GUARD_LUT is None:
+        cos_grid = np.linspace(-1.0, 1.0, 2048)
+        angle_grid = np.degrees(np.arccos(cos_grid))
+        span = max(1e-6, REL_HUE_ZERO - REL_HUE_FULL)
+        _HUE_GUARD_LUT = np.clip(
+            (REL_HUE_ZERO - angle_grid) / span, 0.0, 1.0
+        ).astype(np.float32)
+        _HUE_ANGLE_LUT = angle_grid.astype(np.float32)
+    idx = np.clip(((cosang + 1.0) * 1023.5).astype(np.int32), 0, 2047)
+    hue_ramp = _HUE_GUARD_LUT[idx]
+    off = _HUE_ANGLE_LUT[idx] * np.sign(dot)
     abs_ramp = np.clip((mag - ABS_NEUTRAL_FLOOR) / ABS_NEUTRAL_RAMP, 0.0, 1.0)
-    return (hue_ramp * abs_ramp).astype(np.float32)
+    return (hue_ramp * abs_ramp).astype(np.float32), off.astype(np.float32)
+
+
+def _print_blobs(guard: Any, off: Any, mag: Any, box_region: Any) -> Any:
+    """Hue-aligned small blobs that float in a printed-fabric base, as a mask.
+
+    Structure, not neighbourhood share, identifies a print: a flower is a
+    small connected component of hue-aligned pixels ringed by low-chroma /
+    foreign-hue ground, while the garment body is one component far above
+    ``PRINT_BLOB_MAX_AREA`` — or pressed against other SATURATED garments,
+    whose chroma disqualifies them as base (a wine cardigan leaning on a
+    green couch must NOT be exempted just because the couch is foreign-hued).
+
+    Returns a boolean mask of the exempted blobs (their recolour weight
+    becomes zero).
+    """
+    import cv2
+    import numpy as np
+
+    aligned = ((guard > 0.5) & box_region).astype(np.uint8)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(aligned, connectivity=8)
+    # Base = foreign-hued low-chroma ground (cream, blue flowers) or true
+    # neutral (white). A foreign-hued but saturated neighbour does not count.
+    base = (
+        ((np.abs(off) > PRINT_FOREIGN_HUE_DEG) & (mag < PRINT_BASE_MAG_MAX))
+        | (mag < PRINT_NEUTRAL_MAG)
+    ) & box_region
+    kernel = np.ones((PRINT_SURROUND_PX, PRINT_SURROUND_PX), np.uint8)
+    blob_mask = np.zeros(box_region.shape, dtype=bool)
+    small_ids = [
+        i
+        for i in range(1, num)
+        if stats[i, cv2.CC_STAT_AREA] <= PRINT_BLOB_MAX_AREA
+    ]
+    if not small_ids:
+        return blob_mask
+    if len(small_ids) > 200:
+        # Degenerate fragmentation (noisy guard): fall back to one combined
+        # ring test instead of per-blob passes.
+        small = np.isin(labels, np.array(small_ids, dtype=np.int32))
+        ring = (
+            cv2.dilate(small.astype(np.uint8), kernel).astype(bool)
+            & ~small
+            & box_region
+        )
+        if ring.any() and float(base[ring].mean()) >= PRINT_SURROUND_MIN:
+            blob_mask = small
+        return blob_mask
+    for i in small_ids:
+        blob = labels == i
+        ring = (
+            cv2.dilate(blob.astype(np.uint8), kernel).astype(bool)
+            & ~blob
+            & box_region
+        )
+        if not ring.any():
+            continue  # blob fills its surroundings: treat as garment body
+        if float(base[ring].mean()) >= PRINT_SURROUND_MIN:
+            blob_mask |= blob
+    return blob_mask
 
 
 def _recolor(
@@ -629,10 +774,33 @@ def _recolor(
 
     main_da, main_db = _region_main_chroma(a, b, box_region)
     main_chroma = float(np.hypot(main_da, main_db))
+    relative = main_chroma >= NEUTRAL_MAIN_CHROMA
     if neutral_guard:
-        if main_chroma >= NEUTRAL_MAIN_CHROMA:
-            guard = _relative_guard(a, b, main_da, main_db)
+        if relative:
+            guard, off = _relative_guard(a, b, main_da, main_db)
             extra["guard_mode"] = "relative_hue"
+            va = a - 128.0
+            vb = b - 128.0
+            mag = np.sqrt(va * va + vb * vb)
+            # Bright near-neutral pixels are foreign whites, not garment
+            # shadow (see NEUTRAL_L_MARGIN): kill their weight outright.
+            l_plane = lab[:, :, 0]
+            l_main = float(np.median(l_plane[box_region]))
+            chroma_cap = min(NEUTRAL_CHROMA_MAX, 0.5 * main_chroma)
+            bright_neutral = (mag < chroma_cap) & (
+                l_plane > l_main + NEUTRAL_L_MARGIN
+            )
+            guard = np.where(bright_neutral, 0.0, guard)
+            # Print exemption: a hue-aligned SMALL blob whose surrounding ring
+            # reads as printed-fabric base (cream ground, white, blue flowers)
+            # is a flower of the shirt, not of the garment. The garment body is
+            # either one blob far above the size cap, or pressed against other
+            # SATURATED garments whose chroma disqualifies them as "base".
+            blob_mask = _print_blobs(guard, off, mag, box_region)
+            weight = s * guard * (~blob_mask).astype(np.float32)
+            extra["print_protected_frac"] = round(
+                float(blob_mask.sum()) / max(1, int(box_region.sum())), 4
+            )
         else:
             # No dominant hue in the region: fall back to the absolute ramp.
             chroma = np.abs(a - 128.0) + np.abs(b - 128.0)
@@ -641,7 +809,7 @@ def _recolor(
                 np.float32
             )
             extra["guard_mode"] = "absolute_chroma"
-        weight = s * guard
+            weight = s * guard
         extra["neutral_pixels_protected"] = int(((guard < 0.5) & box_region).sum())
         extra["main_chroma"] = round(main_chroma, 1)
     else:
@@ -658,6 +826,24 @@ def _recolor(
         # skipping them is what mottled the knit. The boundary follows the
         # mask rather than a blur, which would reintroduce a coloured halo.
         skip = skin & (y > SKIN_SKIP_MIN_Y)
+        if relative:
+            # Shadowed skin escapes the Y gate too: the chest V under the
+            # chin measured Y 90-125 and got dyed pale green. Skin is always
+            # WARMER than a red/wine main hue, so skin-flagged pixels inside
+            # a warm band off the main hue are skipped as well — the garment
+            # misdetects sit ON the main hue (offset ~0) and stay recoloured.
+            # NOTE: a/b are the raw 0-255 planes; the hue needs the 128 centre
+            # removed, and the difference wraps into [-180, 180).
+            sy, sx = np.where(skin)
+            if sy.size:
+                main_hue_deg = float(np.degrees(np.arctan2(main_db, main_da)))
+                off = (
+                    np.degrees(np.arctan2(b[sy, sx] - 128.0, a[sy, sx] - 128.0))
+                    - main_hue_deg
+                    + 180.0
+                ) % 360.0 - 180.0
+                warm = (off > SKIN_WARM_OFFSET_MIN) & (off < SKIN_WARM_OFFSET_MAX)
+                skip[sy, sx] |= warm
         weight = weight * (1.0 - skip.astype(np.float32))
         extra["skin_pixels_protected"] = int((skip & box_region).sum())
     else:
