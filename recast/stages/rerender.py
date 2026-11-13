@@ -14,6 +14,12 @@ frames; joints never observed in the whole clip (e.g. ankles that stay below
 the frame edge) are flagged ``unobserved`` and are NOT invented by
 interpolation — the retarget step must hold them in a standing pose instead.
 
+Each frame also carries a fitted body scale (``scale_px``): the smoothed
+neck->feet pixel span (mid-shoulder to the lowest observed ankle), which the
+retarget/render fit must use instead of the whole-person bbox height — the
+bbox includes the head and reads ~13% tall on a standing figure (see
+:func:`fit_body_scale`).
+
 Coordinate conventions (written down once, used by every later step):
 
 * Image: origin top-left, x right, y down, pixels. ``z`` is MediaPipe world
@@ -199,6 +205,96 @@ def _frame_bbox(keypoints: list[dict[str, Any]]) -> list[float] | None:
     return [min(xs), min(ys), max(xs), max(ys)]
 
 
+def _kp(frame: dict[str, Any], name: str) -> dict[str, Any] | None:
+    """The named keypoint entry of a pose frame, or None."""
+    return next((k for k in frame["keypoints"] if k["name"] == name), None)
+
+
+def _kp_usable(kp: dict[str, Any] | None) -> bool:
+    """A keypoint counts as measured only when observed and inside the frame."""
+    return bool(
+        kp
+        and kp.get("observed")
+        and kp.get("in_frame", True)
+        and kp.get("y") is not None
+    )
+
+
+# Standing figure: mid-shoulder -> ankle over mid-shoulder -> mid-hip,
+# measured on the Xbot rest skeleton (1.354 m / 0.466 m). Only used when the
+# ankles are not measurable (half-body shot) and no earlier scale exists.
+NECK_TO_FEET_PER_TORSO = 2.91
+
+
+def fit_body_scale(frames: list[dict[str, Any]], *, fps: float) -> dict[str, Any]:
+    """Fit a per-frame body scale from the neck->feet span, head-free.
+
+    The fitted scale must NOT come from the whole-person bbox: the head sits
+    ABOVE the neck->feet span and inflates it by ~13% on a standing figure,
+    which shrinks the fitted character scale by the same ~13% (measured on
+    the pilot clip: bbox height / neck->feet span = 1.13). The span used
+    here is the mid-shoulder line (the neck) down to the lowest observed,
+    in-frame ankle — the head never enters the fit.
+
+    Per frame this records:
+
+    * ``scale_px`` — the smoothed neck->feet span in pixels;
+    * ``scale_source`` — "feet" | "held" | "proportion" | "unavailable";
+    * ``feet_y_px`` — the measured feet line (None when it was estimated).
+
+    Smoothing follows the keypoint smoother's idea (1€ filter, the same
+    filter :class:`KeypointSmoother` runs on the joints): real ankle
+    measurements drive the filter, while held/proportion frames reuse the
+    last filtered value without disturbing it — ankles that are missing or
+    cropped by the frame edge (half-body shot) fall back to the last valid
+    scale, or to a torso-proportion estimate when there is none, and never
+    invent a garbage foot line.
+    """
+    from recast.stages.pose import OneEuroFilter
+
+    filt = OneEuroFilter(max(1.0, float(fps or 25.0)))
+    last_valid: float | None = None
+    sources: dict[str, int] = {}
+    feet_scales: list[float] = []
+    for fr in frames:
+        ls, rs = _kp(fr, "left_shoulder"), _kp(fr, "right_shoulder")
+        neck_y = None
+        if _kp_usable(ls) and _kp_usable(rs):
+            neck_y = (float(ls["y"]) + float(rs["y"])) / 2.0
+        ankles = (_kp(fr, "left_ankle"), _kp(fr, "right_ankle"))
+        feet_y = max(
+            (float(a["y"]) for a in ankles if _kp_usable(a)), default=None
+        )
+        value = None
+        source = "unavailable"
+        if neck_y is not None and feet_y is not None and feet_y > neck_y:
+            value = filt.filter(feet_y - neck_y)
+            last_valid = value
+            source = "feet"
+        elif last_valid is not None:
+            value = last_valid
+            source = "held"
+        elif neck_y is not None:
+            lh, rh = _kp(fr, "left_hip"), _kp(fr, "right_hip")
+            if _kp_usable(lh) and _kp_usable(rh):
+                torso = (float(lh["y"]) + float(rh["y"])) / 2.0 - neck_y
+                if torso > 1.0:
+                    value = NECK_TO_FEET_PER_TORSO * torso
+                    source = "proportion"
+        fr["scale_px"] = None if value is None else round(float(value), 2)
+        fr["scale_source"] = source
+        fr["feet_y_px"] = None if feet_y is None else round(float(feet_y), 2)
+        sources[source] = sources.get(source, 0) + 1
+        if source == "feet":
+            feet_scales.append(float(value))
+    return {
+        "scale_sources": sources,
+        "scale_px_mean": (
+            round(sum(feet_scales) / len(feet_scales), 2) if feet_scales else None
+        ),
+    }
+
+
 def _summarise(frames: list[dict[str, Any]]) -> dict[str, Any]:
     scores = [
         float(k.get("score") or 0.0) for fr in frames for k in fr["keypoints"]
@@ -297,6 +393,10 @@ def estimate_pilot_pose(
             if float(k.get("score") or 0.0) < LOW_CONF_THRESHOLD
         ]
         fr["bbox_xyxy"] = _frame_bbox(fr["keypoints"])
+    # Fitted body scale: neck -> feet span (head-free), smoothed over time.
+    # ``bbox_xyxy`` above is raw data (it legitimately includes the head);
+    # the scale fit must not read it — see fit_body_scale.
+    body_scale = fit_body_scale(frames, fps=fps)
     summary = _summarise(frames)
     payload = {
         "format": POSE_FORMAT,
@@ -311,6 +411,7 @@ def estimate_pilot_pose(
         "model_complexity": int(model_complexity),
         "low_conf_threshold": LOW_CONF_THRESHOLD,
         "frames": frames,
+        "body_scale": body_scale,
         "summary": summary,
     }
     pose_path = out_dir / "pose.json"
@@ -318,12 +419,15 @@ def estimate_pilot_pose(
         json.dumps(payload, ensure_ascii=False), encoding="utf-8"
     )
     log.info(
-        "试点姿态已写出: %s（%d 帧，平均置信度 %.3f，可渲染=%s，未观测关节=%s）",
+        "试点姿态已写出: %s（%d 帧，平均置信度 %.3f，可渲染=%s，未观测关节=%s，"
+        "拟合尺度来源=%s，尺度均值=%s px）",
         pose_path,
         len(frames),
         summary["mean_score"],
         summary["renderable"],
         summary["unobserved_joints"],
+        body_scale["scale_sources"],
+        body_scale["scale_px_mean"],
     )
     return payload
 

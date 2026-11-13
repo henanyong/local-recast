@@ -232,7 +232,7 @@ def replace_clip(
     *,
     character_folder: str | Path,
     mask_fn: Callable[[Any, int], Any],
-    neck_y_fn: Callable[[Any, int], int] | None = None,
+    neck_y_fn: Callable[[Any, int], int],
     parts: tuple[str, ...] = ("upper",),
     auto_garment: bool = False,
     do_face: bool = False,
@@ -245,7 +245,12 @@ def replace_clip(
     ``mask_fn(frame_bgr, index) -> mask`` is required: the segmentation
     backend is a policy decision (mediapipe's legacy API was removed in
     0.10.35, SCHP is not wired yet), so this function refuses to invent one.
-    ``neck_y_fn`` defaults to a proportional guess flagged in the report.
+    ``neck_y_fn(frame_bgr, index) -> int`` is required too: a guessed neck
+    line (the old 42%-of-frame-height default) shifts every upper/lower
+    garment edge, so a wrong guess silently wrecked whole clips. Pass
+    ``estimate_neck_y`` (:mod:`recast.stages.person_mask`) — it returns
+    ``{"neck_y": ...}`` measured from a detected face. Missing either one
+    raises before any frame is processed.
 
     Frames are gated BEFORE they reach the writer: when :func:`rejection_reason`
     flags the final composite (face + garment, audited against the source
@@ -264,6 +269,13 @@ def replace_clip(
 
     video_path = Path(video_path)
     out_path = Path(out_path)
+    if neck_y_fn is None:
+        raise TypeError(
+            "neck_y_fn 是必填项：脖子切口必须来自实测（例如用 "
+            "recast.stages.person_mask.estimate_neck_y 的结果包装成 "
+            "neck_y_fn），不再接受画面高度 42% 的比例猜测——猜错一次，"
+            "整段上下身分界全错。"
+        )
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         raise RuntimeError(f"打不开视频：{video_path}")
@@ -274,7 +286,6 @@ def replace_clip(
     writer = open_ffmpeg_writer(out_path, width, height, fps)
     rows: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
-    proportional_neck = neck_y_fn is None
     idx = 0
     notes: list[str] = []
     try:
@@ -285,9 +296,7 @@ def replace_clip(
             if frame_limit is not None and idx >= frame_limit:
                 break
             mask = mask_fn(frame, idx)
-            neck_y = (
-                neck_y_fn(frame, idx) if neck_y_fn is not None else int(frame.shape[0] * 0.42)
-            )
+            neck_y = int(neck_y_fn(frame, idx))
             result = replace_frame(
                 frame,
                 character_folder=character_folder,
@@ -336,8 +345,6 @@ def replace_clip(
 
     if idx == 0:
         raise RuntimeError(f"没有处理任何帧：{video_path}")
-    if proportional_neck:
-        notes.append("脖子切口用的是画面高度 42% 的比例估计，不是姿态关键点")
 
     scored = [r for r in rows if r["seam_ratio"] is not None]
     seams = [r["seam_ratio"] for r in scored]

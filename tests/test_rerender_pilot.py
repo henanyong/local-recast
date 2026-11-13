@@ -130,6 +130,164 @@ def test_summarise_not_renderable_on_long_low_run():
     assert summary["renderable"] is False
 
 
+# ----- fitted body scale: neck->feet span, head-free, smoothed, fallback -----
+
+
+def _scale_frame(**joints):
+    """Build one pose frame from name -> (y_px, observed) kwargs.
+
+    Shoulders/hips default to an observed standing figure (neck 400,
+    hips 700, ankles 1100, nose 250 — the head sticks out well above the
+    neck line, exactly the trap the fit must avoid).
+    """
+    defaults = {
+        "nose": (250.0, True),
+        "left_shoulder": (390.0, True),
+        "right_shoulder": (410.0, True),
+        "left_hip": (690.0, True),
+        "right_hip": (710.0, True),
+        "left_ankle": (1090.0, True),
+        "right_ankle": (1110.0, True),
+    }
+    defaults.update(joints)
+    kpts = []
+    for name in COCO_17_NAMES:
+        y, observed = defaults.get(name, (500.0, False))
+        kpts.append(
+            {
+                "name": name,
+                "x": 10.0,
+                "y": y,
+                "z": 0.0,
+                "score": 0.9 if observed else 0.0,
+                "in_frame": True,
+                "interpolated": False,
+                "observed": observed,
+            }
+        )
+    return {"frame": 0, "keypoints": kpts}
+
+
+def test_fit_body_scale_excludes_the_head():
+    from recast.stages.rerender import fit_body_scale
+
+    frames = [_scale_frame(), _scale_frame()]
+    summary = fit_body_scale(frames, fps=24.0)
+    # neck line = (390+410)/2 = 400; feet = max(ankle y) = 1110.
+    assert frames[0]["scale_px"] == pytest.approx(710.0, abs=1.5)
+    assert frames[0]["scale_source"] == "feet"
+    assert frames[0]["feet_y_px"] == pytest.approx(1110.0)
+    # The head must NOT be in the span: the bbox height (nose 250 ->
+    # ankle 1110 = 860 px) is the old inflated reading.
+    assert frames[0]["scale_px"] < 800.0
+    assert summary["scale_sources"] == {"feet": 2}
+
+
+def test_fit_body_scale_smooths_frame_to_frame_jitter():
+    from recast.stages.rerender import fit_body_scale
+
+    frames = []
+    for feet in (1110.0, 1210.0, 1110.0):  # ~100 px jumps in the raw span
+        frames.append(
+            _scale_frame(left_ankle=(feet - 20.0, True), right_ankle=(feet, True))
+        )
+    fit_body_scale(frames, fps=24.0)
+    s = [fr["scale_px"] for fr in frames]
+    raw = [810.0, 910.0, 810.0]  # unsmoothed neck->feet spans
+    # The first sample passes through (1€ filter), later samples are damped:
+    # the smoothed series must not swing by the full raw jump.
+    assert s[0] == pytest.approx(710.0, abs=1.5)
+    assert abs(s[1] - s[0]) < raw[1] - raw[0]
+    assert abs(s[2] - s[1]) < raw[1] - raw[0]
+
+
+def test_fit_body_scale_holds_last_valid_when_feet_cropped():
+    from recast.stages.rerender import fit_body_scale
+
+    frames = [
+        _scale_frame(),
+        # Half-body shot: ankles far below the frame edge, marked out of frame.
+        _scale_frame(left_ankle=(2500.0, False), right_ankle=(2510.0, False)),
+    ]
+    frames[1]["keypoints"][15]["in_frame"] = False
+    frames[1]["keypoints"][16]["in_frame"] = False
+    summary = fit_body_scale(frames, fps=24.0)
+    assert frames[1]["scale_source"] == "held"
+    assert frames[1]["scale_px"] == pytest.approx(frames[0]["scale_px"])
+    assert frames[1]["feet_y_px"] is None
+    assert summary["scale_sources"] == {"feet": 1, "held": 1}
+
+
+def test_fit_body_scale_falls_back_to_torso_proportion():
+    from recast.stages.rerender import NECK_TO_FEET_PER_TORSO, fit_body_scale
+
+    frames = [
+        _scale_frame(left_ankle=(1100.0, False), right_ankle=(1100.0, False))
+    ]
+    summary = fit_body_scale(frames, fps=24.0)
+    # neck 400, hips mid 700 -> torso 300 px; feet estimated from proportion.
+    assert frames[0]["scale_source"] == "proportion"
+    assert frames[0]["scale_px"] == pytest.approx(
+        NECK_TO_FEET_PER_TORSO * 300.0, rel=0.01
+    )
+    assert frames[0]["feet_y_px"] is None
+    assert summary["scale_sources"] == {"proportion": 1}
+
+
+def test_fit_body_scale_unavailable_without_a_body():
+    from recast.stages.rerender import fit_body_scale
+
+    missing = {
+        name: (500.0, False)
+        for name in (
+            "left_shoulder",
+            "right_shoulder",
+            "left_hip",
+            "right_hip",
+            "left_ankle",
+            "right_ankle",
+        )
+    }
+    frames = [_scale_frame(**missing)]
+    fit_body_scale(frames, fps=24.0)
+    assert frames[0]["scale_px"] is None
+    assert frames[0]["scale_source"] == "unavailable"
+
+
+def test_estimate_pilot_pose_records_body_scale(tmp_path, monkeypatch):
+    """estimate_pilot_pose wires the fitted scale into pose.json."""
+    import cv2
+    import numpy as np
+
+    import recast.stages.rerender as rr
+
+    fake_kpts = [
+        {"x": k["x"], "y": k["y"], "z": k["z"], "score": k["score"]}
+        for k in _scale_frame()["keypoints"]
+    ]
+
+    class FakeEstimator:
+        def estimate(self, frame, bboxes, track_ids=None):
+            return [[dict(kp) for kp in fake_kpts]]
+
+        def close(self) -> None:
+            pass
+
+    clip = tmp_path / "in.mp4"
+    writer = cv2.VideoWriter(
+        str(clip), cv2.VideoWriter_fourcc(*"mp4v"), 10, (64, 1200)
+    )
+    for _ in range(2):
+        writer.write(np.zeros((1200, 64, 3), dtype=np.uint8))
+    writer.release()
+
+    monkeypatch.setattr(rr, "MediaPipeEstimator", lambda **kw: FakeEstimator())
+    payload = rr.estimate_pilot_pose(clip, tmp_path / "out")
+    assert payload["body_scale"]["scale_sources"] == {"feet": 2}
+    assert payload["frames"][0]["scale_px"] == pytest.approx(710.0, abs=1.5)
+    assert (tmp_path / "out" / "pose.json").is_file()
+
+
 # --- retarget tests: synthetic mini Mixamo skeleton + synthetic pose frames ---
 
 import json as _json

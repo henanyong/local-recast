@@ -48,17 +48,21 @@ def _solid(h=40, w=40, bgr=(200, 40, 40)):
     return np.full((h, w, 3), bgr, dtype=np.uint8)
 
 
-def _two_tone_body(h=120, w=80):
-    """A *coloured* garment with a print-like split.
-
-    A grey body would be neutral, and the neutral guard would (correctly)
-    refuse to recolour it — so colour-behaviour tests need real chroma.
+def _two_tone_body(h=120, w=160):
+    """A garment with a print-like minority split, as in the real footage:
+    the cardigan is the dominant hue mass (2/3), the minority print (1/3) is
+    what must survive. A grey body would be neutral, and the neutral guard
+    would (correctly) refuse to recolour it — so colour-behaviour tests need
+    real chroma. Halves are wide enough to sit outside each other's
+    print-suppression neighbourhood.
     """
+    span = (X1 - X0) * 3  # 60 px: 40 px dominant hue + 20 px minority
+    split = X0 + (span * 2) // 3
     frame = np.full((h, w, 3), 120, dtype=np.uint8)
-    frame[TOP:, X0 : X0 + (X1 - X0) // 2] = (40, 60, 190)
-    frame[TOP:, X0 + (X1 - X0) // 2 : X1] = (60, 170, 90)
+    frame[TOP:, X0:split] = (40, 60, 190)
+    frame[TOP:, split : X0 + span] = (60, 170, 90)
     mask = np.zeros((h, w), dtype=np.uint8)
-    mask[TOP:, X0:X1] = 255
+    mask[TOP:, X0 : X0 + span] = 255
     return frame, mask
 
 
@@ -68,26 +72,23 @@ def _lab_l(bgr):
 
 def test_colour_comes_from_the_reference():
     """语义已改（相对主色保护）：与区域主色同向的那一半全额换向参考色，
-    偏色的另一半被降权但仍向参考色移动——这是"开衫换了、里面的花衬衫
-    保住"这个真实需求在合成数据上的对应行为。"""
+    偏色的另一半被降权但仍与主色半区可区分——这是"开衫换了、里面的花
+    衬衫保住"这个真实需求在合成数据上的对应行为。"""
     frame, mask = _two_tone_body()
     out = transfer_garment(frame, mask, TOP, _solid(bgr=(200, 40, 40)), part="full")
     img = out["image"]
     lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB).astype(np.float32)
-    red_half = (slice(TOP, 120), slice(X0, X0 + (X1 - X0) // 2))
-    green_half = (slice(TOP, 120), slice(X0 + (X1 - X0) // 2, X1))
+    before_lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+    mid = X0 + ((X1 - X0) * 3 * 2) // 3
+    red_half = (slice(TOP, 120), slice(X0 + 8, mid - 8))  # interior, off the seam
+    green_half = (slice(TOP, 120), slice(mid + 8, X0 + (X1 - X0) * 3 - 8))
     a_red = float(lab[red_half][:, :, 1].mean())
     a_green = float(lab[green_half][:, :, 1].mean())
-    before_red = float(
-        cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)[red_half][:, :, 1].mean()
-    )
     # The main-hue half lands clearly on the reference colour...
     assert a_red > 60.0, f"主色半区没有换到参考色（a={a_red:.1f}）"
     # ...and moved further than the off-hue half, which is ramped down.
-    delta_red = a_red - before_red
-    delta_green = a_green - float(
-        cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)[green_half][:, :, 1].mean()
-    )
+    delta_red = a_red - float(before_lab[red_half][:, :, 1].mean())
+    delta_green = a_green - float(before_lab[green_half][:, :, 1].mean())
     assert delta_red > delta_green, "偏色半区的移动幅度不该超过主色半区"
     assert a_green < a_red - 30.0, "偏色半区必须仍然与主色半区可区分"
 
@@ -525,12 +526,43 @@ def test_relative_guard_keys_on_hue_not_magnitude():
 
     a = np.array([[150.0, 134.0, 128.0, 130.0, 103.0]], np.float32)  # +22, +6, 0, +2, -25
     b = np.array([[138.0, 131.0, 128.0, 140.0, 118.0]], np.float32)  # +10, +3, 0, +12, -10
-    guard = _relative_guard(a, b, 22.0, 10.0)
+    guard, off = _relative_guard(a, b, 22.0, 10.0)
     assert float(guard[0, 0]) > 0.95, "亮部本体必须全额换色"
     assert float(guard[0, 1]) > 0.95, "暗部与主色同向，必须全额换色（斑驳根源）"
     assert float(guard[0, 2]) == 0.0, "真正的中性色（白领子）必须保护"
     assert float(guard[0, 3]) < 0.3, "偏色的印花/奶油底色要大幅降权"
     assert float(guard[0, 4]) == 0.0, "反向色相的像素必须保护"
+    # Signed hue offset: aligned pixels ~0, warm foreign positive, cool negative.
+    assert abs(float(off[0, 0])) < 10.0
+    assert float(off[0, 3]) > 20.0, "奶油底比酒红主色暖得多"
+    assert float(off[0, 4]) < -20.0, "蓝花比酒红主色冷得多"
+
+
+def test_print_blob_in_a_light_base_is_exempt():
+    """嵌在奶油底里的小块同色相红花属于衬衫印花，必须整块豁免；
+    而主导色相的大块开衫（哪怕紧邻异色物）不受影响。"""
+    frame = np.full((220, 340, 3), 120, dtype=np.uint8)
+    frame[TOP:, 30:160] = (40, 30, 120)  # wine cardigan, ~23k px blob
+    frame[TOP:, 160:260] = (205, 220, 235)  # cream blouse base
+    frame[TOP + 20 : TOP + 50, 175:195] = (60, 50, 170)  # a red flower on it
+    mask = np.zeros((220, 340), dtype=np.uint8)
+    mask[TOP:, 30:260] = 255
+
+    out = transfer_garment(frame, mask, TOP, _solid(bgr=(120, 180, 120)), part="full")
+    lab_after = cv2.cvtColor(out["image"], cv2.COLOR_BGR2LAB).astype(np.float32)
+    lab_before = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB).astype(np.float32)
+    flower = (slice(TOP + 22, TOP + 48), slice(177, 193))
+    cardigan = (slice(TOP + 2, 218), slice(34, 158))
+    delta_flower = (
+        lab_after[flower][:, :, 1] - lab_before[flower][:, :, 1]
+    )
+    delta_cardigan = (
+        lab_after[cardigan][:, :, 1] - lab_before[cardigan][:, :, 1]
+    )
+    assert float(np.abs(delta_flower).mean()) < 3.0, (
+        f"奶油底里的红花被染色了（|Δa|={np.abs(delta_flower).mean():.1f}）"
+    )
+    assert float(delta_cardigan.mean()) < -15.0, "开衫主体没有换到参考色"
 
 
 def test_shadow_and_light_of_one_garment_recolour_together():
