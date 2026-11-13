@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
 
 from recast.core.service import RecastService
 from recast.config import PROJECT_ROOT
+from recast.desktop.dialog_utils import cap_dialog_to_screen, scroll_wrap
 
 
 class GenerateDialog(QDialog):
@@ -27,12 +28,15 @@ class GenerateDialog(QDialog):
         super().__init__(parent)
         self.service = service
         self.setWindowTitle("按剧本生成新集")
-        self.resize(640, 320)
+        # P5/B3: content scrolls, the OK/Cancel bar is pinned at the
+        # bottom, dialog clamped to the screen (was resize(640, 320)).
+        cap_dialog_to_screen(self, 640, 320)
         self.name = QLineEdit("开局即打·第1集")
         self.pack = QLineEdit(str(PROJECT_ROOT / "examples" / "开局即打-第1集模板"))
         self.storyboard = QLineEdit()
         self.dialogue = QLineEdit()
-        form = QFormLayout()
+        content = QWidget()
+        form = QFormLayout(content)
         form.addRow("剧目名称", self.name)
         form.addRow("模板包目录", self._browse(self.pack, "选择模板包目录", dir=True))
         form.addRow("分镜文本/JSON", self._browse(self.storyboard, "选择分镜文件"))
@@ -44,13 +48,13 @@ class GenerateDialog(QDialog):
         )
         note.setWordWrap(True)
         note.setStyleSheet("color:#8b90a0;")
+        form.addRow(note)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(note)
-        layout.addWidget(buttons)
+        self._buttons = buttons
+        root = QVBoxLayout(self)
+        root.addWidget(scroll_wrap(content, buttons))
 
     def _browse(self, edit: QLineEdit, title: str, dir: bool = False) -> QWidget:
         w = QWidget()

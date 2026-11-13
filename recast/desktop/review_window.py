@@ -7,6 +7,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
+    QCheckBox,
     QDialog,
     QHBoxLayout,
     QLabel,
@@ -26,10 +27,11 @@ class ReviewWindow(QDialog):
         super().__init__(parent)
         self.service = service
         self.drama_id = drama_id
+        self._enhance_flags: dict[str, dict[str, bool]] = {}
         self.setWindowTitle("质量终检")
         self.resize(980, 520)
-        self.table = QTableWidget(0, 6)
-        self.table.setHorizontalHeaderLabels(["镜头", "原因", "相似度", "参考脸", "详情", "状态"])
+        self.table = QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(["镜头", "原因", "相似度", "参考脸", "详情", "状态", "增强"])
         self.table.setColumnWidth(0, 90)
         self.table.setColumnWidth(1, 120)
         self.table.setColumnWidth(2, 70)
@@ -51,6 +53,7 @@ class ReviewWindow(QDialog):
         row.addStretch(1)
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("低相似人脸会带上参考脸缩略图和分数。选中一行后可重跑该镜头，或标为通过 / 忽略。"))
+        layout.addWidget(QLabel("“增强”列：开——合成时对这个镜头做轻量增强（去噪 + 锐化），默认关；只影响该镜头，不用整段重跑。"))
         layout.addWidget(self.table, 1)
         layout.addLayout(row)
         self.reload()
@@ -76,6 +79,38 @@ class ReviewWindow(QDialog):
             self.table.setCellWidget(i, 3, thumb)
             self.table.setItem(i, 4, QTableWidgetItem(str(r.get("detail") or "")))
             self.table.setItem(i, 5, QTableWidgetItem(str(r.get("status") or "")))
+            self.table.setCellWidget(i, 6, self._enhance_box(r))
+
+    def _enhance_box(self, rec: dict) -> QCheckBox:
+        """逐镜头后处理开关（PM 第 2 轮 4.2）：只影响这一个镜头，默认关。"""
+        box = QCheckBox()
+        box.setToolTip("开：合成时对这个镜头做轻量增强（去噪 + 锐化）。")
+        task_id = str(rec.get("task_id") or "")
+        shot = str(rec.get("shot_code") or "")
+        flags = self._enhance_flags.get(task_id)
+        if flags is None:
+            try:
+                flags = self.service.shot_enhance_flags(task_id)
+            except Exception:
+                flags = {}
+            self._enhance_flags[task_id] = dict(flags or {})
+        box.setChecked(bool((flags or {}).get(shot, False)))
+        box.stateChanged.connect(
+            lambda _st, t=task_id, s=shot, b=box: self._set_enhance(t, s, b)
+        )
+        return box
+
+    def _set_enhance(self, task_id: str, shot_code: str, box: QCheckBox) -> None:
+        wanted = box.isChecked()
+        try:
+            self.service.set_shot_enhance(task_id, shot_code, wanted)
+        except Exception as exc:
+            box.blockSignals(True)
+            box.setChecked(not wanted)
+            box.blockSignals(False)
+            QMessageBox.warning(self, "无法设置增强", str(exc))
+            return
+        self._enhance_flags.setdefault(task_id, {})[shot_code] = wanted
 
     def _rerun(self) -> None:
         row = self.table.currentRow()

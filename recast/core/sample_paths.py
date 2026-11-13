@@ -46,7 +46,8 @@ def _output_root(output_root: str | Path) -> Path:
 
 
 def _blocked(parts: tuple[str, ...]) -> bool:
-    return any(part in _BLOCKED_DIR_NAMES or part in {".", ".."} for part in parts)
+    # Windows 路径不区分大小写，目录名统一转小写再比对，Models / .VENV 这类写法也拦得住。
+    return any(part.lower() in _BLOCKED_DIR_NAMES or part in {".", ".."} for part in parts)
 
 
 def _inside_sample_dir(parts: tuple[str, ...]) -> bool:
@@ -81,7 +82,7 @@ def plan_sample_removal(path: str | Path, output_root: str | Path) -> SampleDeci
         parts = resolved.relative_to(root).parts
     except ValueError:
         return SampleDecision("skip", resolved, f"拒绝删除输出目录以外的路径：{resolved}")
-    if _blocked(parts) or (parts and parts[0] == "l2"):
+    if _blocked(parts) or (parts and parts[0].lower() == "l2"):
         return SampleDecision("skip", resolved, f"拒绝删除该路径：{resolved}")
     if not resolved.is_file():
         return SampleDecision("skip", resolved, f"拒绝删除目录：{resolved}")

@@ -141,11 +141,17 @@ def post_replace_review_items(
     )
 
 
-def try_embed_sample(sample: dict[str, Any], video: str | Path | None = None) -> tuple[list[float], list[float]] | None:
+def try_embed_sample(
+    sample: dict[str, Any],
+    video: str | Path | None = None,
+    *,
+    model: str | None = None,
+) -> tuple[list[float], list[float]] | None:
     """InsightFace embeddings of the reference still and one replaced frame.
 
     Returns None when InsightFace or the frame is unavailable. Weights are not
-    downloaded or committed by this check.
+    downloaded or committed by this check. ``model`` follows
+    ``identity.model`` when the caller passes it; otherwise buffalo_l.
     """
     reference = sample.get("reference")
     if not reference or not Path(str(reference)).is_file():
@@ -162,11 +168,13 @@ def try_embed_sample(sample: dict[str, Any], video: str | Path | None = None) ->
     except Exception as exc:
         log.info("未安装 OpenCV，换脸相似度未计算: %s", exc)
         return None
+    model_name = model or "buffalo_l"
     app = getattr(try_embed_sample, "_app", None)
-    if app is None:
-        app = FaceAnalysis(name="buffalo_s", providers=["CPUExecutionProvider"])
+    if app is None or getattr(try_embed_sample, "_app_model", None) != model_name:
+        app = FaceAnalysis(name=model_name, providers=["CPUExecutionProvider"])
         app.prepare(ctx_id=-1, det_size=(320, 320))
         setattr(try_embed_sample, "_app", app)
+        setattr(try_embed_sample, "_app_model", model_name)
 
     def _vec(image) -> list[float] | None:
         faces = app.get(image) or []

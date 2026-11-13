@@ -72,7 +72,7 @@ def test_word_times_snap_toward_shot_cuts_and_tighten_duration():
 def test_yaml_beam_sizes_stay_put():
     eight = (PROJECT_ROOT / "configs" / "4060ti-8g.yaml").read_text(encoding="utf-8")
     sixteen = (PROJECT_ROOT / "configs" / "4060ti-16g.yaml").read_text(encoding="utf-8")
-    assert "beam_size: 1" in eight
+    assert "beam_size: 3" in eight
     assert "beam_size: 3" in sixteen
     assert RecastConfig().whisper.beam_size == 1
     assert RecastConfig().whisper.no_speech_prob == 0.6
@@ -169,3 +169,35 @@ def test_cache_miss_falls_back_and_double_failure_is_explicit(tmp_path: Path, mo
         assert "本地缓存" in str(exc)
     else:
         raise AssertionError("expected a cache-and-download failure")
+
+
+def test_download_timeout_fails_fast(tmp_path: Path, monkeypatch):
+    import time
+
+    class SlowDownload:
+        def __init__(self, name, **kwargs):
+            if kwargs.get("local_files_only"):
+                raise RuntimeError("no cache")
+            time.sleep(10)
+
+        def transcribe(self, path, **kwargs):
+            return iter([]), _Info()
+
+    fake = types.ModuleType("faster_whisper")
+    fake.WhisperModel = SlowDownload
+    monkeypatch.setitem(sys.modules, "faster_whisper", fake)
+    from recast.stages.subtitles import run
+
+    wav = tmp_path / "audio.wav"
+    wav.write_bytes(b"RIFF")
+    cfg = RecastConfig()
+    cfg.whisper.download_timeout_sec = 0.2
+    started = time.monotonic()
+    try:
+        run(wav, tmp_path, cfg)
+    except RuntimeError as exc:
+        assert "超时" in str(exc)
+        assert "本机缓存" in str(exc)
+    else:
+        raise AssertionError("expected a download timeout")
+    assert time.monotonic() - started < 5.0

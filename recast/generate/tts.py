@@ -41,16 +41,19 @@ def _duration(path: Path) -> float:
             return 0.0
 
 
-def _try_edge_tts(text: str, dest: Path, voice: str | None = None) -> bool:
+def _try_edge_tts(text: str, dest: Path, voice: str | None = None, *, timbre: dict[str, Any] | None = None) -> bool:
     try:
         import asyncio
         import edge_tts  # type: ignore
     except Exception:
         return False
     voice = voice or "zh-CN-XiaoxiaoNeural"
+    from recast.generate.timbre import edge_tts_kwargs
+
+    kwargs = edge_tts_kwargs(timbre)
 
     async def _run() -> None:
-        comm = edge_tts.Communicate(text, voice)
+        comm = edge_tts.Communicate(text, voice, **kwargs)
         await comm.save(str(dest))
 
     try:
@@ -71,7 +74,7 @@ def _pyttsx3_engine() -> Any:
     return _PYTTSX3
 
 
-def _try_pyttsx3(text: str, dest: Path) -> bool:
+def _try_pyttsx3(text: str, dest: Path, *, timbre: dict[str, Any] | None = None) -> bool:
     try:
         engine = _pyttsx3_engine()
     except Exception:
@@ -79,6 +82,10 @@ def _try_pyttsx3(text: str, dest: Path) -> bool:
     try:
         # do not set a high rate — never speed up to fit a slot
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if timbre is not None and hasattr(engine, "setProperty"):
+            from recast.generate.timbre import normalize_timbre, pyttsx3_wpm
+
+            engine.setProperty("rate", pyttsx3_wpm(normalize_timbre(timbre)["rate"]))
         engine.save_to_file(text, str(dest))
         engine.runAndWait()
         return dest.is_file() and dest.stat().st_size > 0
@@ -106,15 +113,23 @@ def discover_piper_model(voice: str | None = None) -> Path | None:
     return None
 
 
-def _try_piper(text: str, dest: Path, model: Path) -> bool:
+def _try_piper(text: str, dest: Path, model: Path, *, timbre: dict[str, Any] | None = None) -> bool:
     exe = shutil.which("piper")
     if not exe:
         return False
     import subprocess
 
     dest.parent.mkdir(parents=True, exist_ok=True)
+    argv = [exe, "--model", str(model)]
+    if timbre is not None:
+        from recast.generate.timbre import normalize_timbre, piper_length_scale
+
+        scale = piper_length_scale(normalize_timbre(timbre)["rate"])
+        if scale != 1.0:
+            argv += ["--length-scale", f"{scale:.3f}"]
+    argv += ["--output_file", str(dest)]
     proc = subprocess.run(
-        [exe, "--model", str(model), "--output_file", str(dest)],
+        argv,
         input=text,
         text=True,
         capture_output=True,
@@ -170,10 +185,22 @@ def synthesize_line(
     voice: str | None = None,
     wav_source: str | Path | None = None,
     allow_engines: bool = True,
+    timbre: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Produce a wav for one line. Prefer an imported wav, then a local engine, else skip."""
+    """Produce a wav for one line. Prefer an imported wav, then a local engine, else skip.
+
+    ``timbre`` is {"pitch": semitones, "rate": multiplier, "style": str};
+    it is applied where the engine supports it (edge-tts rate/pitch,
+    Piper rate, pyttsx3 rate) and reported otherwise.
+    """
+    from recast.generate.timbre import is_default, normalize_timbre, timbre_note
+
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
+    timbre = normalize_timbre(timbre)
+    # Keep old callers (and their monkeypatched engine fakes) working:
+    # only pass timbre when it actually changes something.
+    extra = {} if is_default(timbre) else {"timbre": timbre}
     if wav_source and Path(wav_source).is_file():
         src = Path(wav_source)
         if src.resolve() != dest.resolve():
@@ -181,9 +208,9 @@ def synthesize_line(
                 shutil.copyfile(src, dest)
             else:
                 _ffmpeg_copy(src, dest)
-        return {"ok": True, "path": str(dest), "source": "import", "duration": _duration(dest), "skipped": False}
+        return {"ok": True, "path": str(dest), "source": "import", "duration": _duration(dest), "skipped": False, "timbre": timbre}
     if not (text or "").strip():
-        return {"ok": True, "path": None, "source": "empty", "duration": 0.0, "skipped": True}
+        return {"ok": True, "path": None, "source": "empty", "duration": 0.0, "skipped": True, "timbre": timbre}
     spec = classify_voice(voice)
     note = ""
     if allow_engines:
@@ -196,10 +223,12 @@ def synthesize_line(
                 "duration": _duration(dest),
                 "skipped": False,
                 "voice": str(reference),
+                "timbre": timbre,
+                "message": timbre_note(timbre, "local-clone"),
             }
         if reference is not None:
             note = "已记录角色参考 wav，但没有设置 RECAST_TTS_CLONE，不能离线克隆音色。"
-        if spec["piper_model"] is not None and _try_piper(text, dest, spec["piper_model"]):
+        if spec["piper_model"] is not None and _try_piper(text, dest, spec["piper_model"], **extra):
             return {
                 "ok": True,
                 "path": str(dest),
@@ -207,9 +236,10 @@ def synthesize_line(
                 "duration": _duration(dest),
                 "skipped": False,
                 "voice": str(spec["piper_model"]),
-                "message": note,
+                "timbre": timbre,
+                "message": (note + " " + timbre_note(timbre, "piper")).strip(),
             }
-        if spec["edge_voice"] and _try_edge_tts(text, dest, voice=spec["edge_voice"]):
+        if spec["edge_voice"] and _try_edge_tts(text, dest, voice=spec["edge_voice"], **extra):
             return {
                 "ok": True,
                 "path": str(dest),
@@ -217,10 +247,11 @@ def synthesize_line(
                 "duration": _duration(dest),
                 "skipped": False,
                 "voice": spec["edge_voice"],
-                "message": "edge-tts 是微软在线语音，不是本地引擎。",
+                "timbre": timbre,
+                "message": (note + " " + timbre_note(timbre, "edge-tts") + " edge-tts 是微软在线语音，不是本地引擎。").strip(),
             }
         local_model = None if spec["piper_model"] is not None else discover_piper_model(None)
-        if local_model is not None and _try_piper(text, dest, local_model):
+        if local_model is not None and _try_piper(text, dest, local_model, **extra):
             return {
                 "ok": True,
                 "path": str(dest),
@@ -228,9 +259,10 @@ def synthesize_line(
                 "duration": _duration(dest),
                 "skipped": False,
                 "voice": str(local_model),
-                "message": note or "使用本机 piper 模型，未联网。",
+                "timbre": timbre,
+                "message": (note or "使用本机 piper 模型，未联网。") + " " + timbre_note(timbre, "piper"),
             }
-        if not spec["edge_voice"] and _try_edge_tts(text, dest, voice=None):
+        if not spec["edge_voice"] and _try_edge_tts(text, dest, voice=None, **extra):
             return {
                 "ok": True,
                 "path": str(dest),
@@ -238,16 +270,18 @@ def synthesize_line(
                 "duration": _duration(dest),
                 "skipped": False,
                 "voice": "zh-CN-XiaoxiaoNeural",
-                "message": "edge-tts 是微软在线语音，不是本地引擎。",
+                "timbre": timbre,
+                "message": (timbre_note(timbre, "edge-tts") + " edge-tts 是微软在线语音，不是本地引擎。").strip(),
             }
-        if _try_pyttsx3(text, dest):
+        if _try_pyttsx3(text, dest, **extra):
             return {
                 "ok": True,
                 "path": str(dest),
                 "source": "pyttsx3",
                 "duration": _duration(dest),
                 "skipped": False,
-                "message": (note + " 已用本机 pyttsx3，音色机械。").strip(),
+                "timbre": timbre,
+                "message": (note + " 已用本机 pyttsx3，音色机械。 " + timbre_note(timbre, "pyttsx3")).strip(),
             }
     log.info("没有可用的离线配音，也没有导入对白 wav。edge-tts 需要联网。已跳过配音，仍会导出 SRT。")
     return {
@@ -256,6 +290,7 @@ def synthesize_line(
         "source": "skip",
         "duration": 0.0,
         "skipped": True,
+        "timbre": timbre,
         "message": "已跳过配音。edge-tts 是微软在线服务；离线请把 piper 的 .onnx 放到 models/piper/（不要提交权重），或导入 wav / 设置 RECAST_TTS_CLONE。仍会写出 SRT。",
     }
 
@@ -312,7 +347,9 @@ def synthesize_table(
     wav_table: dict[str, Path] | None = None,
     voices: dict[str, str] | None = None,
     allow_engines: bool = True,
+    timbres: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Synthesize every shot's line. ``timbres`` maps speaker/character_id -> timbre."""
     dest_dir = Path(dest_dir)
     dest_dir.mkdir(parents=True, exist_ok=True)
     results = []
@@ -326,8 +363,11 @@ def synthesize_table(
         voice = str(sh.get("voice") or "").strip()
         if not voice and voices:
             voice = voices.get(str(sh.get("speaker") or "")) or voices.get(str(sh.get("character_id") or "")) or ""
+        timbre = None
+        if timbres:
+            timbre = timbres.get(str(sh.get("speaker") or "")) or timbres.get(str(sh.get("character_id") or ""))
         out = dest_dir / f"{code}.wav"
-        rec = synthesize_line(text, out, voice=voice or None, wav_source=src, allow_engines=allow_engines)
+        rec = synthesize_line(text, out, voice=voice or None, wav_source=src, allow_engines=allow_engines, timbre=timbre)
         sh["audio_path"] = rec.get("path")
         sh["audio_source"] = rec.get("source")
         sh["audio_duration"] = rec.get("duration")

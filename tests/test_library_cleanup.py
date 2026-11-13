@@ -209,7 +209,12 @@ def test_delete_character_refuses_l2_paths_outside_the_tree(tmp_path: Path):
     secret = link_target / "secret.bin"
     secret.write_text("keep", encoding="utf-8")
     link = output / "l2" / "escape"
-    link.symlink_to(link_target, target_is_directory=True)
+    try:
+        link.symlink_to(link_target, target_is_directory=True)
+    except OSError:
+        # Windows without admin rights or Developer Mode cannot create
+        # symlinks (WinError 1314): skip instead of failing the suite.
+        pytest.skip("创建符号链接需要管理员权限或 Windows 开发者模式，跳过。")
     svc.store.set_character_asset(ch["id"], "3d", str(link / "asset.json"), complete=True)
     with pytest.raises(PermissionError, match="拒绝删除"):
         svc.delete_character(ch["id"])
@@ -249,11 +254,33 @@ def test_shared_sample_and_nested_models_are_not_deleted(tmp_path: Path):
 
     link = output / "workbench" / "job-a" / "face_samples" / "link.jpg"
     target = _face(tmp_path / "Documents" / "picked.jpg")
-    link.symlink_to(target)
+    try:
+        link.symlink_to(target)
+    except OSError:
+        # Windows without admin rights or Developer Mode cannot create
+        # symlinks (WinError 1314): skip instead of failing the suite.
+        pytest.skip("创建符号链接需要管理员权限或 Windows 开发者模式，跳过。")
     with pytest.raises(SamplePathError, match="拒绝删除"):
         remove_generated_sample_file(link, output)
     assert target.is_file() and link.is_symlink()
     assert plan_sample_removal(link, output).action == "skip"
+
+
+def test_blocked_dirs_are_case_insensitive(tmp_path: Path):
+    # Windows 路径不区分大小写，Models / .VENV / L2 这类写法也不能绕过拦截。
+    svc = _service(tmp_path)
+    output = Path(svc.settings.output_root)
+    variants = (
+        _face(output / "Models" / "face_samples" / "hidden.jpg"),
+        _face(output / ".VENV" / "face_samples" / "x.jpg"),
+        _face(output / "L2" / "face_samples" / "y.jpg"),
+        _face(output / "workbench" / "job-a" / "MODELS" / "face_samples" / "z.jpg"),
+    )
+    for unsafe in variants:
+        assert plan_sample_removal(unsafe, output).action == "skip"
+        with pytest.raises(SamplePathError, match="拒绝删除"):
+            require_generated_sample_file(unsafe, output)
+        assert unsafe.is_file()
 
 
 def test_clean_invalid_samples_removes_people_without_a_valid_face(tmp_path: Path):
@@ -372,6 +399,98 @@ def test_clean_invalid_samples_removes_people_without_a_valid_face(tmp_path: Pat
     assert svc.list_invalid_samples()["remove_count"] == 0
 
 
+def test_clean_invalid_samples_refuses_when_output_root_is_unreachable(tmp_path: Path):
+    # 输出盘没挂载时，所有人脸都会被判成“不存在”：清理必须直接拒绝，
+    # 不能把整库人物都删了。
+    svc = _service(tmp_path)
+    output = Path(svc.settings.output_root)
+    good = _sample(output, "Person_1")
+    owner = _unconfirmed(svc, "Person_1")
+    _add_face(svc, owner["id"], good)
+    assert svc.list_invalid_samples()["remove_count"] == 0
+
+    svc.update_settings(output_root=str(tmp_path / "unmounted-drive"))
+    with pytest.raises(RuntimeError, match="输出目录不可用"):
+        svc.clean_invalid_samples()
+    assert svc.store.get_character(owner["id"]) is not None
+    assert good.is_file()
+
+    svc.update_settings(output_root=str(output))
+    assert svc.clean_invalid_samples()["remove_count"] == 0
+    assert svc.store.get_character(owner["id"]) is not None
+
+
+def test_delete_character_refuses_when_a_job_uses_the_person(tmp_path: Path):
+    from recast.core.scheduler import Job
+
+    svc = _service(tmp_path)
+    output = Path(svc.settings.output_root)
+    sample = _sample(output, "Person_1")
+    person = _unconfirmed(svc, "Person_1")
+    _add_face(svc, person["id"], sample)
+    drama = svc.store.insert("dramas", origin_name="旧剧", root_path=str(tmp_path / "drama"), status="待执行")
+    task = svc.store.insert("tasks", drama_id=drama["id"], episode_name="第01集", video_path=str(tmp_path / "a.mp4"))
+
+    # 排队中的任务引用了这个人：拒绝删除，人物和样本都在。
+    svc.scheduler._queue.append(
+        Job(drama_id=drama["id"], task_id=task["id"], stages=["replace"], character_ids=[person["id"]])
+    )
+    with pytest.raises(RuntimeError, match="正被任务使用"):
+        svc.delete_character(person["id"])
+    assert svc.store.get_character(person["id"]) is not None
+    assert sample.is_file()
+
+    # 排队任务不引用这个人时可以删；运行中的任务引用时同样拒绝。
+    svc.scheduler._queue.clear()
+    other = _unconfirmed(svc, "Person_2")
+    svc.scheduler._running_jobs[task["id"]] = Job(
+        drama_id=drama["id"], task_id=task["id"], stages=["replace"], character_id=other["id"]
+    )
+    svc.delete_character(person["id"])
+    assert svc.store.get_character(person["id"]) is None
+    assert not sample.exists()
+    with pytest.raises(RuntimeError, match="正被任务使用"):
+        svc.delete_character(other["id"])
+    assert svc.store.get_character(other["id"]) is not None
+
+
+def test_delete_character_partial_failure_keeps_person_and_reports(tmp_path: Path, monkeypatch):
+    svc = _service(tmp_path)
+    output = Path(svc.settings.output_root)
+    first = _sample(output, "Person_1", "00_f1.jpg")
+    second = _sample(output, "Person_1", "01_f1.jpg")
+    person = _unconfirmed(svc, "Person_1")
+    _add_face(svc, person["id"], first)
+    _add_face(svc, person["id"], second)
+
+    real_unlink = Path.unlink
+
+    def _flaky(self, missing_ok=False):
+        if self.resolve() == second.resolve():
+            raise PermissionError("文件被占用")
+        return real_unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", _flaky)
+    result = svc.delete_character(person["id"])
+    assert result["partial"] is True
+    assert len(result["failed"]) == 1
+    assert result["failed"][0]["path"] == str(second)
+    assert result["removed_samples"] == [str(first)]
+    assert not first.exists() and second.is_file()
+    # 人物还在库里，没删掉的样本行也还在；已删的样本行去掉。
+    saved = svc.store.get_character(person["id"])
+    assert saved is not None
+    kept = [row for row in saved["assets"] if row.get("kind") == "face"]
+    assert [row["path"] for row in kept] == [str(second)]
+
+    # 占用解除后重试，能删干净。
+    monkeypatch.undo()
+    result = svc.delete_character(person["id"])
+    assert result["partial"] is False
+    assert svc.store.get_character(person["id"]) is None
+    assert not second.exists()
+
+
 def test_library_window_delete_button_follows_selection(tmp_path: Path):
     import os
 
@@ -387,8 +506,8 @@ def test_library_window_delete_button_follows_selection(tmp_path: Path):
     labels = [button.text() for button in empty.findChildren(QPushButton)]
     assert "删除人物" in labels
     assert "清理失效样本" in labels
-    assert "删除 3D头像资产" in labels
-    assert "清理未使用的 3D头像资产" in labels
+    assert "删除头像卡片" in labels
+    assert "清理未使用的头像卡片" in labels
     assert empty.delete_char_btn.objectName() == "danger"
     assert not empty.delete_char_btn.isEnabled()
     empty.close()

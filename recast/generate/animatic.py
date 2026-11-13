@@ -190,6 +190,7 @@ def build_animatic(
     fps: int = 24,
     crf: int = 18,
     use_nvenc: bool | None = None,
+    output_root: str | Path | None = None,
 ) -> dict[str, Any]:
     """Build one silent clip per shot and a concatenated silent picture track."""
     workdir = Path(workdir)
@@ -202,7 +203,7 @@ def build_animatic(
         dest = shots_dir / f"{code}.mp4"
         refs: list[Path] = []
         if pack is not None and hasattr(pack, "resolve_shot_refs"):
-            refs = pack.resolve_shot_refs(shot)
+            refs = pack.resolve_shot_refs(shot, output_root=output_root)
         else:
             for item in shot.get("ref_assets") or []:
                 token = item.get("file") if isinstance(item, dict) else item

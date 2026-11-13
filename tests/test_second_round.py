@@ -77,9 +77,9 @@ def test_h264_args_share_one_quality_number_and_nvenc_falls_back(monkeypatch):
     set_nvenc_probe(None)
 
 
-def test_eight_gig_preset_keeps_beam_size_one():
+def test_eight_gig_preset_uses_beam_size_three():
     cfg = RecastConfig.from_yaml(Path("configs/4060ti-8g.yaml"))
-    assert cfg.whisper.beam_size == 1
+    assert cfg.whisper.beam_size == 3
     assert cfg.compose.crf == 18
     assert cfg.compose.use_nvenc is True
     wide = RecastConfig.from_yaml(Path("configs/4060ti-16g.yaml"))
@@ -91,7 +91,7 @@ def test_runtime_settings_override_yaml_without_touching_beam():
     cfg = RecastConfig.from_yaml(Path("configs/4060ti-8g.yaml"))
     settings = AppSettings(export_crf=20, use_nvenc=False, scene_threshold=32, min_shot_sec=0.8, detect_every=6, pose_quality="speed")
     apply_runtime_settings(cfg, settings)
-    assert cfg.whisper.beam_size == 1
+    assert cfg.whisper.beam_size == 3
     assert cfg.compose.crf == 20
     assert cfg.compose.use_nvenc is False
     assert cfg.scene.threshold == 32

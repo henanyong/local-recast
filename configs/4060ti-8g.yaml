@@ -12,7 +12,7 @@ whisper:
   model: small
   compute_type: float16
   device: cuda
-  beam_size: 1
+  beam_size: 3
   vad_filter: true
 
 detect:
@@ -23,11 +23,24 @@ detect:
   tracker: bytetrack.yaml
 
 identity:
-  model: buffalo_s
+  model: buffalo_l
   det_size: 512
   cluster_threshold: 0.45
   max_faces_per_track: 24
   sample_every: 5
+
+# B1 跟踪优先：跨镜头轨迹拼接（三票制）。人脸票看样本集最佳配对，
+# 身体票看 CLIP 外观 embedding，服装票看 HSV 直方图；≥2 票且无人脸
+# 强反对才合并。身体票缺 CLIP 时弃权（人脸+服装仍可合并）。
+stitch:
+  face_best_min: 0.6
+  face_median_min: 0.5
+  face_veto: 0.3
+  body_min: 0.75
+  costume_min: 0.8
+  min_votes: 2
+  face_top_pairs: 3
+  face_max_samples: 8
 
 pose:
   # auto: rtmlib (RTMPose lightweight) -> YOLO-pose -> MediaPipe
@@ -47,6 +60,7 @@ replace:
   model_url: https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx
   detect_every: 4
   temporal_alpha: 0.62
+  min_similarity: 0.55
 
 scene:
   # One sensitivity for both cut detectors. 27 matches FFmpeg scene score 0.30.
@@ -58,3 +72,24 @@ compose:
   use_nvenc: true
   audio: original
   burn_subs: false
+
+matting:
+  model: u2net
+
+diarization:
+  sample_rate: 16000
+  min_speech_sec: 0.3
+  min_silence_sec: 0.3
+  merge_gap_sec: 0.5
+  max_speakers: 8
+
+costume:
+  tagger: clip
+  clip_model: ViT-B/32
+
+model3d:
+  backend: triposg
+  triposg_repo: ""
+  # TripoSG 单独 conda 环境的 python（conda create -n tripoSG python=3.10），
+  # 为空则用运行 local-recast 的 python。
+  triposg_python: ""

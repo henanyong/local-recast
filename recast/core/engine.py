@@ -5,9 +5,12 @@ from __future__ import annotations
 import os
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Any
+
+import importlib.util
 
 from recast import __version__
 from recast.config import RecastConfig, resolve_config_path
@@ -100,6 +103,23 @@ def ffmpeg_status(ffmpeg_dir: str = "") -> dict[str, Any]:
 
 
 def module_status() -> dict[str, bool]:
+    """Report whether each heavy optional module is installed.
+
+    No module is imported here (except the rapidocr branch, see below):
+    presence is decided by ``sys.modules`` membership or
+    ``importlib.util.find_spec`` (which only locates the module, it does not
+    execute its code). This matters because ``module_status`` runs both on the
+    main thread (video import) and on the 400ms snapshot refresh thread, and
+    concurrent ``__import__`` collided with PySide6's shiboken import hook
+    and corrupted the heap (SIGSEGV, see SEGFAULT diagnosis 2026-11-13).
+
+    The result is cached process-wide in ``_module_status_cache``; use
+    :func:`clear_engine_cache` to reset it. Cache hits return a *copy* so a
+    caller mutating the dict cannot poison the cache.
+    """
+    global _module_status_cache
+    if _module_status_cache is not None:
+        return dict(_module_status_cache)
     names = {
         "torch": "torch",
         "faster_whisper": "faster_whisper",
@@ -115,15 +135,29 @@ def module_status() -> dict[str, bool]:
     for label, mod in names.items():
         try:
             if mod == "rapidocr":
+                # Kept as-is per the segfault diagnosis: ocr_available() does
+                # not import any heavy module itself.
                 from recast.extract.ocr import ocr_available
 
                 out[label] = ocr_available()[0]
-            else:
-                __import__(mod)
+            elif mod in sys.modules:
                 out[label] = True
+            else:
+                out[label] = importlib.util.find_spec(mod) is not None
         except Exception:
             out[label] = False
-    return out
+    _module_status_cache = out
+    return dict(out)
+
+
+# Process-wide cache for module_status(); find_spec is cheap, so clearing it
+# in clear_engine_cache() is safe and gives tests a reset hook.
+_module_status_cache: dict[str, bool] | None = None
+# Serialises _heavy_snapshot() computation and all engine-cache writes, so at
+# most one thread is ever inside detect_vram_gb()/detect_gpu_name()'s real
+# ``import torch`` or any other heavy probe at a time. RLock because
+# _heavy_snapshot() calls cached_comfy_available(), which takes the same lock.
+_heavy_lock = threading.RLock()
 
 
 _HEAVY_TTL = 5.0
@@ -133,9 +167,11 @@ _comfy_cache: dict[str, tuple[float, bool]] = {}
 
 def clear_engine_cache() -> None:
     """Drop cached GPU / config / ComfyUI probe results."""
-    global _heavy_cache
-    _heavy_cache = None
-    _comfy_cache.clear()
+    global _heavy_cache, _module_status_cache
+    with _heavy_lock:
+        _heavy_cache = None
+        _comfy_cache.clear()
+        _module_status_cache = None
 
 
 def cached_comfy_available(base_url: str | None, *, ttl: float = _HEAVY_TTL, now: float | None = None) -> bool:
@@ -144,15 +180,19 @@ def cached_comfy_available(base_url: str | None, *, ttl: float = _HEAVY_TTL, now
 
     key = base_url or ""
     clock = time.monotonic() if now is None else now
-    hit = _comfy_cache.get(key)
-    if hit is not None and clock - hit[0] < ttl:
-        return hit[1]
+    with _heavy_lock:
+        hit = _comfy_cache.get(key)
+        if hit is not None and clock - hit[0] < ttl:
+            return hit[1]
+    # Probe outside the lock (it has a 1s timeout); two threads racing here
+    # both probe and write the same answer, which is benign.
     ok = bool(key) and comfy_available(base_url)
-    _comfy_cache[key] = (clock, ok)
+    with _heavy_lock:
+        _comfy_cache[key] = (clock, ok)
     return ok
 
 
-def _heavy_snapshot(settings: AppSettings, cfg: RecastConfig | None) -> dict[str, Any]:
+def _heavy_snapshot(settings: AppSettings, cfg: RecastConfig | None, *, light: bool = False) -> dict[str, Any]:
     global _heavy_cache
     key = (
         settings.hardware_tier,
@@ -166,49 +206,67 @@ def _heavy_snapshot(settings: AppSettings, cfg: RecastConfig | None) -> dict[str
         getattr(settings, "min_shot_sec", None),
     )
     now = time.monotonic()
+    if light and _heavy_cache is not None and _heavy_cache[1] == key:
+        # Light mode (400ms timer tick): reuse the cached snapshot even
+        # past the 5s TTL, as long as the key still matches -- the engine
+        # panel values only change when a key field changes, and a key
+        # change (or an empty cache) falls through to the normal locked
+        # recompute below. Ignoring the TTL here is what keeps the timer
+        # thread from re-probing heavy modules every 5 seconds.
+        return _heavy_cache[2]
+    # Fast path: no lock on a cache hit.
     if _heavy_cache is not None and _heavy_cache[1] == key and now - _heavy_cache[0] < _HEAVY_TTL:
         return _heavy_cache[2]
-    vram = detect_vram_gb()
-    gpu = detect_gpu_name()
-    if cfg is None:
-        try:
-            from recast.config import apply_runtime_settings
+    # Slow path: serialise the computation (double-checked locking) so the
+    # 400ms refresh thread and the main thread never probe heavy modules /
+    # import torch at the same time. detect_vram_gb()/detect_gpu_name() still
+    # do a real ``import torch`` -- that is required for VRAM probing, and
+    # the lock guarantees only one thread is inside it at a time.
+    with _heavy_lock:
+        now = time.monotonic()
+        if _heavy_cache is not None and _heavy_cache[1] == key and now - _heavy_cache[0] < _HEAVY_TTL:
+            return _heavy_cache[2]
+        vram = detect_vram_gb()
+        gpu = detect_gpu_name()
+        if cfg is None:
+            try:
+                from recast.config import apply_runtime_settings
 
-            cfg = apply_runtime_settings(
-                RecastConfig.from_yaml(resolve_config_path(settings.config_file())),
-                settings,
-            )
-        except Exception:
-            cfg = None
-    models = status_report(cfg)
-    ffm = ffmpeg_status(settings.ffmpeg_dir)
-    mods = module_status()
-    from recast.assets3d.drive import liveportrait_available
+                cfg = apply_runtime_settings(
+                    RecastConfig.from_yaml(resolve_config_path(settings.config_file())),
+                    settings,
+                )
+            except Exception:
+                cfg = None
+        models = status_report(cfg)
+        ffm = ffmpeg_status(settings.ffmpeg_dir)
+        mods = module_status()
+        from recast.assets3d.drive import liveportrait_available
 
-    comfy_url = getattr(settings, "comfyui_url", "") or ""
-    scene = {
-        "threshold": float(cfg.scene.threshold) if cfg is not None else 27.0,
-        "min_shot_sec": float(cfg.scene.min_shot_sec) if cfg is not None else 0.4,
-        "installed": "pyscenedetect" if mods.get("scenedetect") else "ffmpeg",
-    }
-    encode = {
-        "crf": int(cfg.compose.crf) if cfg is not None else 18,
-        "use_nvenc": bool(cfg.compose.use_nvenc) if cfg is not None else True,
-    }
-    data = {
-        "vram_gb": vram,
-        "gpu_name": gpu,
-        "ffmpeg": ffm,
-        "modules": mods,
-        "models": models,
-        "disk_free_gb": disk_free_gb(settings.output_root or "."),
-        "comfyui": {"url": comfy_url, "ok": cached_comfy_available(comfy_url or None)},
-        "liveportrait": liveportrait_available(),
-        "scene": scene,
-        "encode": encode,
-    }
-    _heavy_cache = (now, key, data)
-    return data
+        comfy_url = getattr(settings, "comfyui_url", "") or ""
+        scene = {
+            "threshold": float(cfg.scene.threshold) if cfg is not None else 27.0,
+            "min_shot_sec": float(cfg.scene.min_shot_sec) if cfg is not None else 0.4,
+            "installed": "pyscenedetect" if mods.get("scenedetect") else "ffmpeg",
+        }
+        encode = {
+            "crf": int(cfg.compose.crf) if cfg is not None else 18,
+            "use_nvenc": bool(cfg.compose.use_nvenc) if cfg is not None else True,
+        }
+        data = {
+            "vram_gb": vram,
+            "gpu_name": gpu,
+            "ffmpeg": ffm,
+            "modules": mods,
+            "models": models,
+            "disk_free_gb": disk_free_gb(settings.output_root or "."),
+            "comfyui": {"url": comfy_url, "ok": cached_comfy_available(comfy_url or None)},
+            "liveportrait": liveportrait_available(),
+            "scene": scene,
+            "encode": encode,
+        }
+        _heavy_cache = (now, key, data)
+        return data
 
 
 def engine_snapshot(
@@ -216,9 +274,17 @@ def engine_snapshot(
     *,
     running: bool = False,
     cfg: RecastConfig | None = None,
+    light: bool = False,
 ) -> dict[str, Any]:
+    """Build the engine status dict.
+
+    ``light=True`` reuses a warm ``_heavy_snapshot`` cache past its 5s TTL
+    (key must still match); an empty or key-mismatched cache recomputes
+    under the lock, so the first paint always gets real data. Default
+    ``light=False`` keeps the previous behaviour.
+    """
     settings = settings or AppSettings()
-    heavy = _heavy_snapshot(settings, cfg)
+    heavy = _heavy_snapshot(settings, cfg, light=light)
     vram = heavy["vram_gb"]
     gpu = heavy["gpu_name"]
     ffm = heavy["ffmpeg"]

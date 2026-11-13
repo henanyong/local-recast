@@ -507,6 +507,82 @@ def subtitles_filter(path: str | Path, dest_dir: str | Path | None = None) -> st
     ascii_srt = prepare_subtitle_file(path, dest_dir)
     return "subtitles=" + _escape_subtitles_path(ascii_srt)
 
+
+# ---------------------------------------------------------------------------
+# 逐镜头后处理增强（换后增强，轻量真实滤镜）
+#
+# 代码里没有 GFPGAN / CodeFormer 这类人脸增强模型，所以增强用 ffmpeg
+# 滤镜实现：轻去噪 + 轻锐化。参数是“救一下换完偏糊的脸”级别，不是
+# 磨皮/重绘——去噪太重会把细节抹掉，锐化太重会出白边。
+#   hqdn3d=4:3:6:4.5  亮度空间去噪 4、色度空间 3、亮度时域 6、色度时域 4.5
+#   unsharp=5:5:0.8   5x5 亮度锐化、强度 0.8，色度不锐化（避免色噪）
+# 逐镜头靠 enable='between(t,start,end)' 只在该镜头时间段内生效；
+# 没有任何镜头开增强时不调用本函数（调用方负责判断）。
+# ---------------------------------------------------------------------------
+
+ENHANCE_FILTER = "hqdn3d=4:3:6:4.5,unsharp=5:5:0.8:5:5:0.0"
+"""单镜头增强滤镜：轻去噪 + 亮度锐化（色度不锐化）。"""
+
+
+def enhance_filter_for_shots(shots: list[dict] | None) -> str | None:
+    """Build the -vf string that enhances only the given shot time ranges.
+
+    Each shot is ``{"start": float, "end": float}`` in seconds. Returns
+    None when there is nothing to enhance (no shots, or no usable range).
+    """
+    ranges: list[tuple[float, float]] = []
+    for sh in shots or []:
+        try:
+            start = float(sh.get("start"))
+            end = float(sh.get("end"))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        if end > start >= 0:
+            ranges.append((start, end))
+    if not ranges:
+        return None
+    parts: list[str] = []
+    for start, end in ranges:
+        enable = f"between(t,{start:g},{end:g})"
+        parts.append(f"hqdn3d=4:3:6:4.5:enable='{enable}'")
+        parts.append(f"unsharp=5:5:0.8:5:5:0.0:enable='{enable}'")
+    return ",".join(parts)
+
+
+def apply_shot_enhance(
+    video: str | Path,
+    output: str | Path,
+    shots: list[dict],
+    *,
+    crf: int = DEFAULT_CRF,
+    use_nvenc: bool | None = None,
+) -> Path:
+    """Re-encode ``video`` with the enhance filter on the given shot ranges.
+
+    Audio is stream-copied. Raises ValueError when ``shots`` has no usable
+    time range; raises FileNotFoundError when the source is missing.
+    """
+    vf = enhance_filter_for_shots(shots)
+    if vf is None:
+        raise ValueError("没有可增强的镜头时间段。")
+    src = Path(video)
+    if not src.is_file():
+        raise FileNotFoundError(f"要增强的视频不存在：{video}")
+    out = Path(output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        has_audio = probe_video(src).has_audio
+    except Exception:
+        has_audio = False
+    audio_args = ["-c:a", "copy"] if has_audio else ["-an"]
+    run_h264(
+        ["-i", str(src), "-vf", vf, H264_SLOT, *audio_args,
+         "-movflags", "+faststart", str(out)],
+        crf=crf,
+        use_nvenc=use_nvenc,
+    )
+    return out
+
 def copy_sidecar_srt(subtitle: str | Path, video_out: str | Path) -> Path | None:
     src = Path(subtitle)
     if not src.is_file():
@@ -514,6 +590,92 @@ def copy_sidecar_srt(subtitle: str | Path, video_out: str | Path) -> Path | None
     dest = Path(video_out).with_suffix(".srt")
     dest.write_bytes(src.read_bytes())
     return dest
+
+
+# ---------------------------------------------------------------------------
+# 遮盖原烧录字幕（字幕替换用；合成阶段在烧新字幕前调用）
+#
+# 原视频底部的烧录字幕是画面的一部分，去不掉，只能遮住再烧新的。
+# 遮盖只动底部字幕带（默认底部 15%），不动画面其他部分。
+# ---------------------------------------------------------------------------
+
+COVER_MODES = ("blur", "bar", "inpaint")
+"""遮盖模式：blur=模糊，bar=黑条，inpaint=修复重绘（未实现，占位）。"""
+
+
+def inpaint_subtitle_band(
+    video: str | Path, output: str | Path, *, band_top: float = 0.85
+) -> Path:
+    """修复重绘底部字幕带（把原字幕擦掉并按背景补全）。
+
+    未实现：这是一个明确标明的入口，占位用。不要把它当成已实现的功能
+    调用——调用会直接抛 NotImplementedError。实现它需要逐帧修复/重绘
+    （OpenCV inpaint 或 LaMa 类模型），是下一轮的工作。
+    """
+    raise NotImplementedError(
+        "修复重绘（inpaint）未实现：目前只支持模糊（blur）和黑条（bar）两种遮盖。"
+        "原烧录字幕仍可用这两种模式盖住后再烧新字幕。"
+    )
+
+
+def cover_subtitle_band(
+    video: str | Path,
+    output: str | Path,
+    *,
+    mode: str = "blur",
+    band_top: float = 0.85,
+    blur_radius: int = 10,
+    crf: int = DEFAULT_CRF,
+    use_nvenc: bool | None = None,
+) -> Path:
+    """Cover the bottom subtitle band of a video (video-only output, no audio).
+
+    ``mode``: "blur" (box-blur the band) or "bar" (paint it black).
+    ``band_top`` is the first row kept (0.85 = bottom 15%). "inpaint"
+    raises NotImplementedError — see :func:`inpaint_subtitle_band`.
+    """
+    if mode not in COVER_MODES:
+        raise ValueError(f"未知的遮盖模式：{mode}，可选 blur / bar / inpaint")
+    if mode == "inpaint":
+        inpaint_subtitle_band(video, output, band_top=band_top)
+    if not 0.5 <= float(band_top) <= 0.95:
+        raise ValueError(f"字幕带顶部位置不合法：{band_top}，应在 0.5 ~ 0.95 之间")
+    src = Path(video)
+    if not src.is_file():
+        raise FFmpegError(f"要遮盖的视频不存在：{video}")
+    out = Path(output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    frac = 1.0 - float(band_top)
+    top = f"{float(band_top):.3f}"
+    height = f"{frac:.3f}"
+    if mode == "blur":
+        radius = max(1, int(blur_radius))
+        graph = (
+            "[0:v]split=2[base][band];"
+            f"[band]crop=iw:ih*{height}:0:ih*{top},"
+            f"boxblur=luma_radius={radius}:luma_power=1:chroma_radius=2:chroma_power=1[bandb];"
+            "[base][bandb]overlay=0:main_h-overlay_h[vout]"
+        )
+        args: list[str] = [
+            "-i", str(src),
+            "-filter_complex", graph,
+            "-map", "[vout]",
+            "-an",
+            H264_SLOT,
+            "-movflags", "+faststart",
+            str(out),
+        ]
+    else:  # mode == "bar"
+        args = [
+            "-i", str(src),
+            "-vf", f"drawbox=x=0:y=ih*{top}:w=iw:h=ih*{height}:color=black:t=fill",
+            "-an",
+            H264_SLOT,
+            "-movflags", "+faststart",
+            str(out),
+        ]
+    run_h264(args, crf=crf, use_nvenc=use_nvenc)
+    return out
 
 
 def open_ffmpeg_writer(

@@ -177,6 +177,7 @@ def run_script_episode(
 
     # ----- generate silent -----
     silent = workdir / "silent.mp4"
+    output_root = getattr(settings, "output_root", None)
     if "generate" in wanted:
         check_cancel()
         from recast.generate.comfy import comfy_available, submit_workflow
@@ -218,7 +219,7 @@ def run_script_episode(
                             continue
                     except Exception as exc:
                         log.warning("ComfyUI 镜头 %s 失败，改用分镜预览成片: %s", code, exc)
-                    refs = pack.resolve_shot_refs(sh)
+                    refs = pack.resolve_shot_refs(sh, output_root=output_root)
                     build_shot_clip(
                         sh,
                         clips_dir / f"{code}.mp4",
@@ -247,7 +248,7 @@ def run_script_episode(
                     target = next((s for s in shots if s.get("shot_code") == rerun_shot), None)
                     if target is None:
                         raise ValueError(f"找不到要重跑的镜头 {rerun_shot}")
-                    refs = pack.resolve_shot_refs(target)
+                    refs = pack.resolve_shot_refs(target, output_root=output_root)
                     dest = workdir / "shots_silent" / f"{rerun_shot}.mp4"
                     build_shot_clip(
                         target,
@@ -277,6 +278,7 @@ def run_script_episode(
                         fps=specs["fps"],
                         crf=crf,
                         use_nvenc=use_nvenc,
+                        output_root=output_root,
                     )
                     silent = Path(result["silent"]) if result.get("silent") else silent
                 rec["message"] = ANIMATIC_NOTE
@@ -309,17 +311,32 @@ def run_script_episode(
             raise ValueError(msg)
         with timed_run(store, task_id=task_id, drama_id=drama_id, step="贴轨与字幕", model="tts/ffmpeg") as rec:
             mark("dub", "贴对白 / 旁白并导出 SRT（不加速音频）", 0.3)
+            from recast.core.character_assets import resolve_voices
             from recast.generate.tts import load_wav_table, synthesize_table
             from recast.generate.stitch import stitch_and_dub
 
             from recast.generate.tts import voices_by_speaker
 
+            speakers = sorted(
+                {
+                    str(sh.get("speaker") or sh.get("character_id") or "")
+                    for sh in shots
+                }
+                - {""}
+            )
+            voices, timbres = resolve_voices(
+                output_root,
+                speakers,
+                store=store,
+                fallback=voices_by_speaker(pack.characters),
+            )
             table = load_wav_table(wav_table) if wav_table else None
             tts = synthesize_table(
                 shots,
                 workdir / "dub",
                 wav_table=table,
-                voices=voices_by_speaker(pack.characters),
+                voices=voices,
+                timbres=timbres,
                 allow_engines=allow_tts,
             )
             if tts.get("skipped"):

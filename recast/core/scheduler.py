@@ -71,6 +71,9 @@ class Scheduler:
         self._lock = threading.Lock()
         self._queue: deque[Job] = deque()
         self._running_ids: set[str] = set()
+        # Running jobs by task id. _running_ids alone cannot say which person a
+        # running job uses, and delete_character needs that answer.
+        self._running_jobs: dict[str, Job] = {}
         self._executor: ThreadPoolExecutor | None = None
         self._futures: list[Future[Any]] = []
         self._last_progress_at = 0.0
@@ -89,6 +92,33 @@ class Scheduler:
     def running(self) -> bool:
         with self._lock:
             return bool(self._running_ids) or bool(self._queue)
+
+    def jobs_using_character(self, character_id: str) -> list[dict[str, Any]]:
+        """Queued or running jobs that reference one character.
+
+        Only live scheduler jobs count: a task row merely marked 待执行 in the
+        database has no character binding yet (the binding is made when the
+        user starts it), so it cannot be broken by a delete.
+        """
+        cid = str(character_id)
+        with self._lock:
+            pending = [(job, "排队中") for job in list(self._queue)]
+            active = [(job, "处理中") for job in list(self._running_jobs.values())]
+        found: list[dict[str, Any]] = []
+        for job, status in pending + active:
+            ids = {str(x) for x in (job.character_ids or []) if x}
+            if job.character_id:
+                ids.add(str(job.character_id))
+            if cid not in ids:
+                continue
+            task = self.store.get("tasks", job.task_id) or {}
+            drama = self.store.get("dramas", job.drama_id) or {}
+            label = (
+                f"{drama.get('new_name') or drama.get('origin_name') or job.drama_id}"
+                f" / {task.get('episode_name') or job.task_id}"
+            )
+            found.append({"task_id": job.task_id, "drama_id": job.drama_id, "status": status, "label": label})
+        return found
 
     def _emit(self, level: str, message: str, task_id: str | None = None) -> None:
         log.log(getattr(logging, level, logging.INFO), message)
@@ -186,6 +216,7 @@ class Scheduler:
                 return
             self._queue.remove(pick)
             self._running_ids.add(pick.task_id)
+            self._running_jobs[pick.task_id] = pick
             assert self._executor is not None
             fut = self._executor.submit(self._run_job, pick)
             self._futures = [item for item in self._futures if not item.done()]
@@ -210,6 +241,7 @@ class Scheduler:
         if not task or not drama:
             with self._lock:
                 self._running_ids.discard(job.task_id)
+                self._running_jobs.pop(job.task_id, None)
                 self.run_done += 1
             return
         self.current_task_id = job.task_id
@@ -323,6 +355,7 @@ class Scheduler:
         self._rollup_drama(job.drama_id)
         with self._lock:
             self._running_ids.discard(job.task_id)
+            self._running_jobs.pop(job.task_id, None)
             self.run_done += 1
         self._changed()
 

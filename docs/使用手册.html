@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>local-recast 使用手册</title>
+<style>
+  :root{
+    --ink:#1c1c1e; --ink2:#5a5a60; --ink3:#8a8a92;
+    --line:#e3e3e8; --bg:#ffffff; --soft:#f6f6f8;
+    --accent:#2f5d8f; --good:#1d7a4d; --warn:#9a5b00;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--soft);color:var(--ink);
+    font:15px/1.75 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+  .page{max-width:960px;margin:0 auto;background:var(--bg);padding:56px 64px 80px}
+  h1{font-size:28px;font-weight:600;margin:0 0 8px;letter-spacing:.5px}
+  h2{font-size:19px;font-weight:600;margin:44px 0 12px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+  h3{font-size:15px;font-weight:600;margin:24px 0 8px;color:var(--ink)}
+  p{margin:10px 0}
+  .sub{color:var(--ink2);font-size:13.5px;margin:0 0 28px}
+  .meta{font-size:12.5px;color:var(--ink3);border-left:3px solid var(--line);padding-left:12px;margin:24px 0 34px}
+  .meta b{color:var(--ink2);font-weight:500}
+  figure{margin:22px 0 26px}
+  figure img{width:100%;display:block;border:1px solid var(--line);border-radius:8px}
+  figcaption{font-size:12.5px;color:var(--ink2);margin-top:8px}
+  figcaption b{color:var(--ink);font-weight:500}
+  pre{background:#f4f5f7;border:1px solid var(--line);border-radius:7px;
+    padding:12px 14px;overflow-x:auto;font:12.5px/1.65 Consolas,Menlo,monospace;color:#243}
+  code{font:12.5px Consolas,Menlo,monospace;background:#f0f1f4;padding:1px 5px;border-radius:4px}
+  table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13.5px}
+  th,td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:left;vertical-align:top}
+  th{background:var(--soft);font-weight:500;color:var(--ink2)}
+  .step{display:flex;align-items:baseline;gap:10px;margin:36px 0 6px}
+  .n{flex:0 0 auto;width:24px;height:24px;border-radius:50%;background:var(--accent);color:#fff;
+    font-size:13px;display:flex;align-items:center;justify-content:center;font-weight:500}
+  .step h2{margin:0;border:0;padding:0;font-size:19px}
+  .tip{background:#f2f7fb;border-left:3px solid var(--accent);padding:10px 14px;margin:14px 0;font-size:13.5px}
+  .warn{background:#fdf6ec;border-left:3px solid var(--warn);padding:10px 14px;margin:14px 0;font-size:13.5px}
+  .ok{color:var(--good);font-weight:500}
+  ul,ol{margin:10px 0;padding-left:22px}
+  li{margin:5px 0}
+  .toc{background:var(--soft);border:1px solid var(--line);border-radius:8px;padding:14px 20px;font-size:13.5px}
+  .toc a{color:var(--accent);text-decoration:none}
+  .toc ol{margin:6px 0}
+  hr{border:0;border-top:1px solid var(--line);margin:36px 0}
+  @media print{body{background:#fff}.page{max-width:none;padding:0}h2{page-break-after:avoid}figure{page-break-inside:avoid}}
+</style>
+</head>
+<body>
+<div class="page">
+
+<h1>local-recast 使用手册</h1>
+<p class="sub">人物库 · 换装预览 · 整段替换</p>
+
+<div class="meta">
+  <b>版本</b> 2026-11-13　·　<b>适用</b> 本机 Windows / RTX 4060 Ti 8GB<br>
+  <b>验证方式</b> 本文每一步都由脚本点击真实按钮跑通，截图取自实际窗口（<code>scripts/ui_drive.py --shots</code>）
+</div>
+
+<div class="toc">
+  <b>目录</b>
+  <ol>
+    <li><a href="#quick">三分钟跑通</a></li>
+    <li><a href="#layout">界面在哪看什么</a></li>
+    <li><a href="#steps">逐步操作（含图）</a></li>
+    <li><a href="#video">整段视频替换</a></li>
+    <li><a href="#metrics">三个指标怎么读</a></li>
+    <li><a href="#trouble">报错对照表</a></li>
+    <li><a href="#appendix">附录：命令与目录</a></li>
+  </ol>
+</div>
+
+<h2 id="quick">1 三分钟跑通</h2>
+<p>开三个窗口，按顺序执行。第一条导入测试人物，第二条打开界面，第三条出单帧对比图。</p>
+<pre>cd C:\Users\LookingUP\Desktop\local-recast\local-recast
+
+:: ① 导入 3 个测试角色（幂等，重复跑不会重复建）
+.venv\Scripts\python.exe scripts\seed_demo_characters.py
+
+:: ② 打开人物库
+.venv\Scripts\python.exe -m recast ui
+
+:: ③ 单帧换装，看效果
+.venv\Scripts\python.exe scripts\demo_replace.py ^
+  --video "C:\Users\LookingUP\Desktop\demo\1\装穷提亲，娶到全家嫌弃的她 第1集_1.mp4" ^
+  --time 90 ^
+  --costume "C:\Users\LookingUP\Desktop\demo\测试素材\服装\04-焦糖长风衣.png" ^
+  --person 0 --part upper</pre>
+<p>第三条命令会在 <code>outputs\_demo\</code> 写出 <code>replace_ab.png</code>（左右对比）和 <code>replace_zoom.png</code>（放大），终端同时打印分割方式与三个审计数字。</p>
+
+<h2 id="layout">2 界面在哪看什么</h2>
+
+<figure>
+  <img src="manual_shots/01-人物库总览.png" alt="人物库窗口总览">
+  <figcaption><b>图 1　人物库主界面</b>　左栏是操作清单与人物列表，中栏是这个人物当前装配了什么，右栏是基本信息与分步按钮。</figcaption>
+</figure>
+
+<table>
+  <tr><th style="width:70px">区域</th><th>看什么</th></tr>
+  <tr><td>左栏顶部</td><td><b>操作清单</b>：六步的完成状态。<span style="color:var(--good)">已导入 / 已定义 / 已抠像</span> 表示这步做过了，灰字「未开始」表示还没做。</td></tr>
+  <tr><td>左栏中部</td><td><b>人物列表</b>：一行一个角色，行尾三个徽标是「已确认 / 授权状态 / 衣服·声音·3D」。行太长会截断，鼠标悬停看全文。</td></tr>
+  <tr><td>中栏</td><td><b>人物装配</b>：脸、身体、衣服分别选了哪个文件。点一下即应用，不用再确认。</td></tr>
+  <tr><td>右栏</td><td><b>资料完整度</b>：脸 / 服装 / 声音 / 3D 四项是否齐。下面 1–5 组按钮就是管线顺序。</td></tr>
+  <tr><td>底部</td><td><b>状态栏</b>：每次操作的结论都在这里，长文本会折行。</td></tr>
+</table>
+
+<div class="tip">
+  <b>右栏的勾选框是折叠开关，不是状态。</b> 勾上表示这组展开显示。所以「3D 模型」被勾上但完整度写「3D：缺失」是正常的——展开不等于有模型。
+</div>
+
+<h2 id="steps">3 逐步操作</h2>
+
+<div class="step"><span class="n">1</span><h2>导入片段</h2></div>
+<p>点左栏的 <code>[导入视频/照片]</code>，选一个视频或图片。导入只是登记路径，还不会跑任何模型——所以这一步是秒完成的。</p>
+
+<figure>
+  <img src="manual_shots/02-导入片段.png" alt="导入后的界面">
+  <figcaption><b>图 2　导入完成</b>　左栏底部出现「已导入：clip_4s.mp4」，操作清单第一项变成 <span class="ok">✓ 已导入</span>，状态栏提示「可以点自动定义人物」。</figcaption>
+</figure>
+
+<div class="warn">
+  <b>建议先用几秒钟的片段试。</b> 长视频在这一步不会变慢，但下一步「自动定义人物」要跑说话人分离，4 秒和 40 分钟差三个数量级。切片段：<br>
+  <code>ffmpeg -ss 88 -t 4 -i 第1集.mp4 -c:v libx264 -crf 20 clip_4s.mp4</code>
+</div>
+
+<div class="step"><span class="n">2</span><h2>选人</h2></div>
+<p>在左栏人物列表里点一行。选中后中栏和右栏才有内容，右栏的按钮也才会亮。</p>
+
+<figure>
+  <img src="manual_shots/03-选中人物.png" alt="选中人物后">
+  <figcaption><b>图 3　选中「林知夏」</b>　中栏显示她的脸图与当前装配；右栏「资料完整度　脸：已齐　服装：已齐　声音：缺失　3D：缺失」。</figcaption>
+</figure>
+
+<div class="step"><span class="n">3</span><h2>抠像</h2></div>
+<p>展开右栏第 <b>2 组</b>，点 <code>[抠像]</code>。它把 <code>face\</code> 里的照片切出透明背景，写进 <code>cutout\</code>。已完成过的照片会跳过，不会重复算。</p>
+
+<figure>
+  <img src="manual_shots/04-抠像完成.png" alt="抠像完成">
+  <figcaption><b>图 4　抠像完成</b>　状态栏：「抠像完成（person-mask）：成功 1 张，失败 0 张。」括号里是实际用工的后端。</figcaption>
+</figure>
+
+<div class="tip">
+  没装 <code>rembg</code> 也能抠。程序会退回本项目自己的分割后端（<code>yolo-seg</code> / <code>rmbg</code>），并保留软边。
+  只有两种都缺的时候才会报错，提示该装什么或该把权重放哪里。
+</div>
+
+<div class="step"><span class="n">4</span><h2>生成设定板</h2></div>
+<p>第 <b>3 组</b>里点 <code>[生成设定板]</code>。它出多角度转盘图 + 外观色卡，落在 <code>sheet\</code>。</p>
+
+<figure>
+  <img src="manual_shots/05-生成设定板.png" alt="设定板生成结果">
+  <figcaption><b>图 5　设定板</b>　状态栏：「设定板已建（只有照片）……主色 黑色、绿色、白色；肤色 小麦。」</figcaption>
+</figure>
+
+<div class="warn">
+  <b>「只有照片」是什么意思。</b> 没有 GLB 模型时，转盘角度图为空，设定板只用照片出调色板和肤色。
+  这是设计如此，不是失败——要角度图得先有 3D 模型（第 3 组 <code>[生成 3D 模型]</code> 或 <code>[导入 3D 模型]</code>）。
+  发色和体型在没做分割时会留空，猜错的发色会污染后面每一次重绘。
+</div>
+
+<div class="step"><span class="n">5</span><h2>换装预览</h2></div>
+<p>第 <b>5 组</b>里点 <code>[换装预览…]</code>。取一帧，把 <code>costume\</code> 里的服装配色换上去，写出前后两张 PNG。</p>
+
+<figure>
+  <img src="manual_shots/06-换装预览.png" alt="换装预览结果">
+  <figcaption><b>图 6　换装预览</b>　状态栏：「换装预览（upper）：分割 yolo-seg，改动 108602 像素，背景损伤 0.000%，接缝增量 1.00× → ok。对比图：…\replace_preview\after_upper.png」</figcaption>
+</figure>
+
+<p>这条状态栏已经给出了全部判断依据：<b>分割用了哪个后端</b>、改了多少像素、背景有没有被破坏、接缝有没有新增、结论是 ok 还是 review。</p>
+
+<h2 id="video">4 整段视频替换</h2>
+<p>预览确认没问题，再用命令行跑整段。界面上的按钮只做单帧预览——整段会跑几分钟，不该由一次点击静默触发。</p>
+
+<pre>.venv\Scripts\python.exe scripts\demo_replace_clip.py ^
+  --video "C:\Users\LookingUP\Desktop\demo\_tests\clip_4s.mp4" ^
+  --frames 120 ^
+  --costume "C:\Users\LookingUP\Desktop\demo\测试素材\服装\04-焦糖长风衣.png" ^
+  --redetect 4 --out outputs\_demo\clip_4s</pre>
+
+<figure>
+  <img src="manual_shots/07-视频前后对比.png" alt="视频替换前后">
+  <figcaption><b>图 7　成片第 2 秒</b>　左：原片　右：换装后。开衫由酒红转焦糖，褶皱、针织纹理、花衬衫印花、脸、头发、字幕、背景全部保留。</figcaption>
+</figure>
+
+<table>
+  <tr><th>参数</th><th>含义</th></tr>
+  <tr><td><code>--frames</code></td><td>跑多少帧。不给就跑完。试参数时给 48 就够判断。</td></tr>
+  <tr><td><code>--redetect</code></td><td>每几帧重新检测一次人。越小越准越慢；<code>4</code> 是速度和稳定性的平衡点。</td></tr>
+  <tr><td><code>--person</code></td><td>画面里第几个人，按占有前景从大到小。</td></tr>
+  <tr><td><code>--part</code></td><td><code>upper</code> / <code>lower</code> / <code>full</code>。非 full 会在腰部留一条分界，这是设计。</td></tr>
+  <tr><td><code>--backend</code></td><td><code>auto</code> 会选本机最好的：<code>yolo-seg</code> → <code>birefnet</code> → <code>rmbg</code> → <code>grabcut</code>。</td></tr>
+</table>
+
+<p>产物在 <code>--out</code> 目录：<code>replaced.mp4</code>（成片）、<code>segment.mp4</code>（同一片段原样重编，用于对比）、外加逐帧审计日志。实测 4 秒 120 帧输入输出帧数一致，外推 168 秒一集约 <b>20 分钟</b>。</p>
+
+<h2 id="metrics">5 三个指标怎么读</h2>
+<table>
+  <tr><th style="width:110px">指标</th><th style="width:120px">合格线</th><th>含义与判断</th></tr>
+  <tr><td>背景损伤</td><td>&lt; 2%</td><td>人物以外被改动的像素比例。换色路径通常 <b>0.000%</b>——背景逐字节没动。一旦超过 2%，说明掩码漏到了背景。</td></tr>
+  <tr><td>接缝增量</td><td>相对原帧 &lt; 1.15×</td><td>颈部的边缘强度相对身体纹理的倍数变化。<b>原帧自身就有 3.2 左右</b>（领子、项链、下颌边），所以只看相对原帧的增量，不看绝对值。</td></tr>
+  <tr><td>填充率</td><td>70–95% 正常</td><td>区域占自身外接框的比例。躯干本来就接近矩形，所以高不一定是错；<b>到 100% 且四边都是直线</b>才说明掩码退化成矩形。</td></tr>
+</table>
+
+<p>状态栏结论 <code>ok</code> 表示三项都没超；<code>review</code> 会在后面列出哪一条超了，按那条去换帧或换后端。</p>
+
+<h2 id="trouble">6 报错对照表</h2>
+<table>
+  <tr><th style="width:260px">提示</th><th>怎么办</th></tr>
+  <tr><td>抠像需要 rembg，未安装</td><td>已修：现在会自动退回本项目分割后端。若仍报此错，说明 <code>models\segmentation\</code> 里也没有权重。</td></tr>
+  <tr><td>没有服装参考图：…\costume</td><td>把一件衣服的平铺图或上身截图放进该人物的 <code>costume\</code>。</td></tr>
+  <tr><td>没有可用的一帧</td><td><code>costume\</code> 和 <code>face\</code> 里都没有图片。先导入照片或抠像。</td></tr>
+  <tr><td>区域填充率 100%，几乎是一个矩形</td><td>掩码漏到背景。换一帧、或换分割后端（<code>--backend</code>）。</td></tr>
+  <tr><td>只分出 N 个人，取不到第 M 个</td><td><code>--person</code> 超出画面实际人数。先给 <code>--person 0</code>。</td></tr>
+  <tr><td>不是大材小用…整片换不上</td><td>参考色与原衣色相差 120° 以上时会像滤镜。换邻近色相的衣服，或接受这个效果。</td></tr>
+</table>
+
+<h2 id="appendix">7 附录</h2>
+
+<h3>目录</h3>
+<pre>项目根
+├─ outputs\characters\&lt;人物&gt;\   face / costume / voice / cutout / model / sheet
+├─ models\segmentation\         yolo11n-seg.pt（6.2MB，已下载）
+├─ docs\manual_shots\           本手册的原始截图
+└─ scripts\
+   ├─ seed_demo_characters.py   导入 / 移除测试角色
+   ├─ demo_replace.py           单帧换装（调参用）
+   ├─ demo_replace_clip.py      整段替换
+   └─ ui_drive.py              点击真实按钮跑一遍（出截图）</pre>
+
+<h3>常用命令</h3>
+<pre>:: 自检：后端、模型、显卡
+.venv\Scripts\python.exe -m recast doctor
+
+:: 移除测试角色（只删 demo-seed 标记的行）
+.venv\Scripts\python.exe scripts\seed_demo_characters.py --remove
+
+:: 重跑本手册的截图
+.venv\Scripts\python.exe scripts\ui_drive.py ^
+  --clip "C:\Users\LookingUP\Desktop\demo\_tests\clip_4s.mp4" ^
+  --character 林知夏 --shots docs\manual_shots</pre>
+
+<h3>测试素材</h3>
+<p><code>Desktop\demo\测试素材\</code>：3 个虚构角色（林知夏 / 沈砚 / 苏晚晴）+ 4 件平铺服装。
+全部由图像模型生成，不对应任何真实人物，因此不涉及肖像权；图片角标「AI生成」是平台标识，不要裁掉。</p>
+
+<div class="warn">
+  <b>对外发布前必读。</b> 生成的成片属于「合成内容」，按 2025-09-01 施行的标识办法必须带显式标识和元数据标识。
+  另外 <code>yolo-seg</code> 是 AGPL、<code>rmbg</code> 是非商用权重，只适合内部自用；要对外交付需换成 BiRefNet（MIT）或买授权。
+</div>
+
+<hr>
+<p class="sub" style="margin:0">本手册的每一步都由 <code>scripts/ui_drive.py</code> 点击真实按钮验证，7/7 通过；
+含「自动定义人物」的 8 步完整一轮同样 8/8 通过（该步会让截图编号错一位，出图时用 <code>--skip-auto-define</code>）。</p>
+
+</div>
+</body>
+</html>

@@ -96,13 +96,28 @@ class TemplatePack:
                     return f
         return None
 
-    def resolve_shot_refs(self, shot: dict[str, Any]) -> list[Path]:
+    def resolve_shot_refs(
+        self, shot: dict[str, Any], *, output_root: str | Path | None = None
+    ) -> list[Path]:
+        """Reference stills for one shot, folder face first for person tokens.
+
+        A token that names a character (e.g. “温念”) resolves to that person's
+        folder face/ when a character folder exists; anything else resolves
+        against the pack's refs directory exactly as before. Without
+        ``output_root`` the behaviour is unchanged.
+        """
         paths: list[Path] = []
         for item in shot.get("ref_assets") or []:
             token = item.get("file") if isinstance(item, dict) else item
             if not token or str(token).startswith("无"):
                 continue
-            found = self.ref_path(str(token))
+            found: Path | None = None
+            if output_root is not None:
+                from recast.core.character_assets import resolve_generation_ref
+
+                found = resolve_generation_ref(output_root, str(token))
+            if found is None:
+                found = self.ref_path(str(token))
             if found:
                 paths.append(found)
         return paths
